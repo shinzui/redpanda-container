@@ -185,7 +185,7 @@ the `just status-*` / `restart-*` / `logs-*` recipe families, and the Caddy
 | 1 | Package Apple Container at its latest release in Nix | docs/plans/1-package-apple-container-at-its-latest-release-in-nix.md | None | None | In Progress |
 | 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Complete |
 | 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Complete |
-| 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | Not Started |
+| 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | In Progress |
 | 5 | Document how projects use the shared Redpanda for testing | docs/plans/5-document-how-projects-use-the-shared-redpanda-for-testing.md | EP-4 | EP-2 | Not Started |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
@@ -362,10 +362,11 @@ candidate**, alongside the store-path drift constraint EP-1 discovered.
 - [x] EP-3: launchd agent declared with `RunAtLoad` and `KeepAlive = { SuccessfulExit = false; }`; readiness polling works (2026-08-09) — the agent itself is exercised at login by EP-4
 - [x] EP-3: module exercised end to end from a standalone `nix build` and a scratch `home-manager` configuration (2026-08-09)
 - [x] EP-3: `docs/adr/` created with the initiative's first two records (2026-08-09)
-- [ ] EP-4: dotfiles consumes the flake input and imports the module; `darwin-rebuild switch` succeeds
-- [ ] EP-4: `rpk` profile generated; produce/consume works from at least two unrelated project directories
-- [ ] EP-4: Console reachable and showing topics; runbook and rollback documented
-- [ ] EP-4: `docs/local-services.md` updated; a full boot with Colima never started is verified
+- [x] EP-4: dotfiles consumes the flake input and imports the module; `darwin-rebuild switch` succeeds (2026-08-09) — no agents lost
+- [x] EP-4: `rpk` profile generated; produce/consume works from two unrelated project directories and `/tmp` (2026-08-09)
+- [x] EP-4: Console reachable via `redpanda.localhost` and showing topics; runbook and rollback documented (2026-08-09)
+- [x] EP-4: `docs/local-services.md` updated (2026-08-09)
+- [ ] EP-4: a full boot with Colima never started is verified — blocked on a reboot; also closes EP-1's outstanding item
 - [ ] EP-5: consumer inventory redone; topic namespacing convention and destructive-command policy decided
 - [ ] EP-5: `docs/using-the-shared-cluster.md` written and self-contained for a reader with no context
 - [ ] EP-5: `kafka-effectful` and `hw-kafka-streamly` migrated off their own brokers; `hw-kafka-client` migrated or documented as an exception
@@ -579,7 +580,36 @@ sleep/wake failure mode rather than assume it away.
 (To be filled during and after implementation.)
 
 
+### Discovered during EP-4 (2026-08-09)
+
+**The dotfiles repository's own documentation was wrong about an unrelated service.**
+`docs/local-services.md` described the Caddy proxy as a system launchd daemon at
+`darwin/local-web-proxy.nix` and documented `sudo launchctl print system/...` for inspecting
+it. That file does not exist; it is `home/local-web-proxy.nix`, declared with
+`launchd.agents`, running as the user agent `com.shinzui.local-web-proxy`. Corrected while
+adding Redpanda to that document. Worth noting at MasterPlan level because it is a reminder
+that `docs/local-services.md` is the convention reference several of these plans lean on,
+and it can be stale in exactly the places nobody has recently needed.
+
+**Adoption required no privileged step at all.** EP-2's finding that
+`sudo container system dns create` does nothing removed an entire branch of anticipated work:
+the plans had budgeted for it possibly becoming a manual runbook step or a `nix-darwin`
+system activation script. The only `sudo` in the initiative is `darwin-rebuild switch`.
+
+**The launchd agent is exercised at activation, not only at login.** `home-manager`
+bootstraps a newly registered agent immediately and `RunAtLoad` fires it, so the
+already-running branch of `redpanda-up` gets tested under launchd rather than under an
+interactive shell — which is where it actually has to work.
+
+
 ## Revision Notes
+
+**2026-08-09 — ADR distillation moved from EP-4 to EP-5.** EP-4 was authored as the last
+child plan and its Milestone 5 closes out the MasterPlan. EP-5 was added afterwards and hard-
+depends on EP-4, so EP-5 is now last. Distilling before EP-5 runs would mean redoing it, and
+EP-5 owns one of the outstanding ADR candidates. EP-4's Progress and Decision Log record the
+change; its Milestone 5 text should be read as "documentation" only, with distillation
+belonging to EP-5.
 
 **2026-08-09 — Added EP-5, "Document how projects use the shared Redpanda for testing".**
 

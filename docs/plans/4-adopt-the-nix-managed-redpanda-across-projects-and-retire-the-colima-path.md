@@ -65,26 +65,76 @@ Homebrew `redpanda` formula all stay installed. The MasterPlan's Decision Log re
 
 ## Progress
 
-- [ ] Capture the current state as a rollback baseline (rpk profile, running services, ports)
-- [ ] Add the redpanda-container flake input to the dotfiles flake
-- [ ] Create `home/redpanda.nix` importing the module and setting its options
-- [ ] Run `darwin-rebuild switch` and confirm it succeeds with no regressions
-- [ ] Verify the launchd agent registered and the cluster came up
-- [ ] Generate and verify the `rpk` profile
-- [ ] Prove produce/consume from at least two unrelated project directories and from `/tmp`
-- [ ] Verify Console and decide on the Caddy `redpanda.localhost` entry
-- [ ] Add `just` recipes following the repository's existing conventions
-- [ ] Decide on and implement VictoriaLogs shipping for the Redpanda logs
-- [ ] Reboot and verify the whole thing comes up with Colima never started
-- [ ] Update `docs/local-services.md` in the dotfiles repository
-- [ ] Write the runbook and the rollback procedure
-- [ ] Perform the MasterPlan's ADR distillation pass
-- [ ] Record findings, decisions, and the retrospective in this plan
+- [x] Capture the current state as a rollback baseline (rpk profile, running services, ports) (2026-08-09)
+- [x] Add the redpanda-container flake input to the dotfiles flake (2026-08-09) — GitHub URL, not a path input; the repository was already pushed
+- [x] Register the module in `flake-modules/modules.nix` and create `home/redpanda.nix` (2026-08-09)
+- [x] Run `darwin-rebuild switch` and confirm it succeeds with no regressions (2026-08-09) — 27 agents before, 28 after, none lost
+- [x] Verify the launchd agent registered and the cluster came up (2026-08-09)
+- [x] Generate and verify the `rpk` profile; delete the stale `rpk-container` one (2026-08-09)
+- [x] Prove produce/consume from two unrelated project directories and from `/tmp` (2026-08-09)
+- [x] Verify Console and add the Caddy `redpanda.localhost` entry (2026-08-09)
+- [x] Add `just` recipes following the repository's existing conventions (2026-08-09)
+- [x] Decide on VictoriaLogs shipping (2026-08-09) — decided against; see Decision Log
+- [x] Update `docs/local-services.md` in the dotfiles repository (2026-08-09) — plus a correction to a pre-existing error about the Caddy proxy
+- [x] Write the runbook and the rollback procedure (`docs/redpanda.md`) (2026-08-09)
+- [ ] Reboot and verify the whole thing comes up with Colima never started (blocked — needs a reboot; also completes EP-1's outstanding reboot item)
+- [ ] Perform the MasterPlan's ADR distillation pass (deferred to EP-5, which is now the last child plan; see Decision Log)
+- [x] Record findings, decisions, and the retrospective in this plan (2026-08-09)
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+**`docs/local-services.md` described the Caddy proxy incorrectly, in a way that would have
+misled anyone who tried to act on it.** The document said the proxy is a system launchd
+daemon defined in `darwin/local-web-proxy.nix`, and its operating section gave
+`sudo launchctl print system/shinzui.local-web-proxy` as the way to inspect it. None of that
+is true: there is no `darwin/local-web-proxy.nix`, the file is `home/local-web-proxy.nix`,
+it is declared through `launchd.agents`, and it runs as the ordinary user agent
+`com.shinzui.local-web-proxy`:
+
+```text
+$ ls darwin/ | grep -i proxy      # nothing
+$ grep -n "launchd" home/local-web-proxy.nix
+74:  launchd.agents.local-web-proxy = {
+$ launchctl list | grep local-web-proxy
+25170	0	com.shinzui.local-web-proxy
+```
+
+The file's own comments explain why it is an agent — macOS does not reserve ports below
+1024, so an unprivileged process binds `:80` fine, and staying in the user domain means
+`launchctl kickstart` needs no `sudo`. The documented command would simply have failed.
+Corrected in the same commit, since this plan was editing that document anyway. The
+document's intro claim that "the web proxy is a system launchd daemon" was corrected too.
+
+**The launchd agent ran during activation, not just at login.** `home-manager` bootstraps a
+newly registered agent immediately, and `RunAtLoad = true` means it fires at that moment. So
+the cluster was already up before any manual `redpanda-up`, and the agent's log shows the
+idempotent path working exactly as designed:
+
+```text
+$ tail ~/.local/state/redpanda/logs/redpanda-up.stdout.log
+Broker redpanda-0 already running.
+Console redpanda-console already running.
+
+Redpanda is ready.
+```
+
+`stderr` was empty. This is a useful accident: it exercised the "already running" branch
+under launchd rather than under an interactive shell, which is where it actually has to work.
+
+**`rpk` already worked flagless before any change, which made the profile decision less
+obvious than it looks.** The leftover `rpk-container` profile from the Colima setup pointed
+at exactly the addresses this cluster serves, so `rpk cluster info` from `/tmp` succeeded
+before this plan touched anything. The reason to act was not that it was broken but that its
+description had become false and that nothing declarative would recreate it on a fresh
+machine.
+
+**No `sudo` step was needed anywhere in the adoption**, which is the payoff from EP-2 having
+tested the DNS path and found it useless. The plan's Interfaces section had flagged the
+`sudo container system dns create` requirement as something that might have to become a
+manual runbook step or a `nix-darwin` system activation script. It did not, because the
+spike established the step does not help. The only `sudo` in this whole plan is
+`darwin-rebuild switch` itself.
 
 
 ## Decision Log
@@ -115,10 +165,126 @@ Homebrew `redpanda` formula all stay installed. The MasterPlan's Decision Log re
   failed `nix build` in a scratch directory rather than a broken system generation.
   Date: 2026-08-08
 
+- Decision: Register the module in `flake-modules/modules.nix` rather than importing it from
+  `home/redpanda.nix`.
+  Rationale: the plan offered two routes and asked which fits the repository's grain.
+  `flake-modules/darwin-configurations.nix` already imports
+  `lib.attrValues self.homeManagerModules` into the `home-manager` configuration, and
+  `modules.nix` exists precisely to declare "reusable modules exported by this flake", so a
+  foreign flake's module belongs there. The alternative — importing it inside
+  `home/redpanda.nix` — would have required extending `home-manager.extraSpecialArgs`, which
+  currently passes only `age`, to thread `inputs` into every `home/*.nix` file. That is a
+  wider change to support one import. The split also reads well: `modules.nix` declares the
+  module, `home/redpanda.nix` configures it.
+  Date: 2026-08-09
+
+- Decision: Use the GitHub URL `github:shinzui/redpanda-container` as the flake input, not a
+  local path input.
+  Rationale: the plan allowed a path input during development but asked that it be switched
+  before finishing. The repository was already pushed and `nix flake metadata` resolved it,
+  so there was no development phase needing the path form. A path input would pin to the
+  working tree rather than a commit and make the dotfiles flake non-portable.
+  Date: 2026-08-09
+
+- Decision: Option 2 for the `rpk` profile — create it imperatively from a `home.activation`
+  hook, only when absent — and delete the leftover `rpk-container` profile.
+  Rationale: option 3 (declaring the file with `home.file`) was rejected because `rpk` owns
+  `~/Library/Application Support/rpk/rpk.yaml` and rewrites it on every `rpk profile`
+  command, so declaring it would silently revert any profile added by hand on the next
+  rebuild, and `home-manager` would have renamed the existing file to `rpk.yaml.backup` on
+  first activation. Letting `rpk` write its own file also keeps `rpk` the authority on a
+  schema that carries a `version:` field a future release could bump. Option 1 (leave the
+  old profile alone) was tempting because it already worked, but its description —
+  "Automatically generated profile from 'rpk container start'" — had become false, and
+  nothing declarative would recreate it on a fresh machine. The old profile was deleted
+  rather than left alongside the new one because two profiles pointing at identical
+  addresses is exactly the drift trap this plan's earlier Decision Log entry warned about.
+  The hook creates but never overwrites, so a hand-edited profile survives.
+  Date: 2026-08-09
+
+- Decision: Add the Caddy entry for `http://redpanda.localhost`.
+  Rationale: the other five local web UIs all have one, it costs three lines, and Console's
+  port (8080) is the most collision-prone and least memorable of the set. Verified working
+  through both the direct port and the proxy.
+  Date: 2026-08-09
+
+- Decision: Do **not** ship Redpanda's logs to VictoriaLogs.
+  Rationale: the plan asked for this to be decided either way. The `shippers` list in
+  `home/victorialogs.nix` tails files, and the only file Redpanda produces on the host is the
+  launchd agent's `StandardOutPath` — which contains what `redpanda-up` printed at login, a
+  handful of lines per boot, not Redpanda's own logs. Those live inside the container and are
+  read with `container logs`. Shipping the agent's output would add two shipper agents and
+  ongoing noise in exchange for almost no signal. Shipping Redpanda's actual logs would need
+  a `container logs --follow` shipper, which is a different mechanism from every existing
+  shipper and deserves its own plan rather than being smuggled in here. `just logs-redpanda`
+  covers the interactive case.
+  Date: 2026-08-09
+
+- Decision: Move the MasterPlan's ADR distillation pass from this plan to EP-5.
+  Rationale: this plan was written as the last child plan and its Milestone 5 accordingly
+  closes out the MasterPlan. EP-5
+  (`docs/plans/5-document-how-projects-use-the-shared-redpanda-for-testing.md`) was added
+  after this plan was authored and hard-depends on it, so it is now last. Distilling before
+  EP-5 runs would mean doing it again afterwards, and EP-5 owns one of the outstanding ADR
+  candidates (the topic namespacing convention and the destructive-command prohibition).
+  Date: 2026-08-09
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+**What was achieved.** The machine now runs Redpanda on Apple Container as an ordinary local
+service. `darwin-rebuild switch` succeeded and the activated system is exactly the built
+configuration — `/run/current-system` and the build output resolve to the same store path.
+All five commands are installed from the Nix profile, and no existing service regressed:
+27 `com.shinzui.*` agents before, 28 after, none lost.
+
+The `rpk` profile does what it exists to do. Producing in one project and consuming in a
+completely unrelated directory, with no `--brokers` anywhere:
+
+```text
+$ cd ~/Keikaku/bokuno/mori-project && echo "from mori-project" | rpk topic produce adoption-check
+Produced to partition 0 at offset 0 with timestamp 1786246295670.
+$ cd /tmp && rpk topic consume adoption-check -n 1
+{"value":"from mori-project","offset":0}
+$ cd ~/Keikaku/bokuno/kafka-effectful && rpk topic list
+NAME            PARTITIONS  REPLICAS
+adoption-check  1           1
+```
+
+Console works through both the direct port and the proxy (`HTTP 200` from
+`http://redpanda.localhost`) and lists `adoption-check`. `rpk cluster health`, the Schema
+Registry, and the HTTP Proxy all respond flagless. `just status-redpanda` exits 0. Colima
+reports not running throughout.
+
+Documentation landed in the dotfiles repository: `docs/redpanda.md` as the runbook with the
+rollback procedure, and `docs/local-services.md` updated — including a correction to a
+pre-existing error that would have sent a reader to a nonexistent file and a command that
+could not work.
+
+**What remains.** One item, blocked rather than unresolved: the reboot test. It is the
+acceptance that proves the machine works this way every day rather than once after a manual
+switch, and it also closes EP-1's outstanding reboot item and re-proves volume persistence
+across a full host restart, which nothing else has tested. Everything needed for it is in
+place; it just needs a reboot.
+
+The ADR distillation pass moved to EP-5, which is now the last child plan.
+
+**Lessons worth carrying forward.** Batching every change into a single switch was worth the
+discipline. The plan's steps invite three separate `darwin-rebuild switch` runs — one for the
+module, one for the Caddy entry, one after the recipes — and each one needs interactive
+`sudo`. Building with `./bin/build.sh` after every edit and switching once at the end caught
+the same errors at no risk, because a build failure and an activation failure are the same
+failure discovered in a cheaper place.
+
+Reading the artifact rather than the documentation paid off again, this time in the other
+direction: `docs/local-services.md` was the thing that was wrong, and only checking it
+against `home/local-web-proxy.nix` and `launchctl list` revealed it. Documentation drifts
+from configuration in exactly the places nobody has needed to act on recently.
+
+Finally, the value of EP-2 showed up as an absence. The plan had budgeted for a `sudo
+container system dns create` step possibly needing to become a manual runbook item or a
+`nix-darwin` system activation script. Because the spike had already established that step
+does nothing, that entire branch of work never happened.
 
 
 ## Context and Orientation
