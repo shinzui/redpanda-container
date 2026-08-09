@@ -306,7 +306,7 @@ candidate.
 - [x] EP-1: `derivations/apple-container.nix` builds Apple Container 1.2.2 and `container --version` reports it (2026-08-08)
 - [x] EP-1: the overlay exposes it and `home/default.nix` installs it (2026-08-08)
 - [x] EP-1: a Linux container runs with Colima stopped, and `container network list` confirms user-defined networks (2026-08-08)
-- [ ] EP-1: `container system start` runs at login and `container system status` reports healthy — mechanism written and its logic verified against the live service, but not yet activated (`sudo darwin-rebuild` needs interactive auth) and not yet reboot-tested
+- [ ] EP-1: `container system start` runs at login and `container system status` reports healthy — module activated and verified running against the current derivation (2026-08-08); the login/reboot half is still unverified pending a reboot
 - [ ] EP-2: image pull, named volume, and port publishing verified with recorded transcripts
 - [ ] EP-2: Redpanda starts in `dev-container` mode and Kafka is reachable from the macOS host
 - [ ] EP-2: container-to-container networking and name resolution verified; internal addressing decided

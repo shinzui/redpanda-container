@@ -75,7 +75,7 @@ Milestone 2 — starting the background service automatically (code complete, ac
 - [x] Write `home/apple-container.nix` with an activation hook, and import it from `home/default.nix` (2026-08-08)
 - [x] Verify the hook's three branches — not running, already running, stale store path — against the live service (2026-08-08)
 - [x] Verify the system builds with the module included (`./bin/build.sh`) (2026-08-08)
-- [ ] Activate it: `sudo ./bin/darwin-rebuild-sungkyung.sh` (blocked — `sudo` needs interactive auth, so the user must run it)
+- [x] Activate it: `sudo ./bin/darwin-rebuild-sungkyung.sh` — run by the user, verified by comparing `/run/current-system` against a fresh build (2026-08-08)
 - [ ] Confirm the service survives a reboot with no manual intervention (blocked on the reboot; `RunAtLoad = true` is present in the plist, so this is expected to pass)
 
 Reporting:
@@ -304,18 +304,42 @@ overlay, packages-output, and `home.packages` registration; and the service modu
 `chore(flake): refresh flake.lock`, committed a pre-existing unrelated working-tree change at
 the user's request and deliberately carries no plan trailers.
 
-**What remains.** Two items, both blocked on things this session could not do rather than on
-unresolved design questions:
+**Activation is done and verified.** The user ran `sudo ./bin/darwin-rebuild-sungkyung.sh`
+(`sudo` on this machine requires interactive authentication, so the agent could not). That the
+activated generation genuinely contains `home/apple-container.nix` was confirmed by building the
+committed configuration and comparing store paths — they are identical, so the running system is
+exactly this configuration and not a stale generation:
 
-The activation hook in `home/apple-container.nix` is written, imported, and *built* — the full
-system builds cleanly with it — but not yet activated, because `sudo` on this machine requires
-interactive authentication and `darwin-rebuild switch` cannot be driven non-interactively. The
-user needs to run `sudo ./bin/darwin-rebuild-sungkyung.sh` from
-`/Users/shinzui/Keikaku/dotfiles.nix`. This is low-risk: the hook's logic was validated
-separately against the live service (all three branches), so activation should be a no-op that
-reports the service already running against the expected store path.
+```text
+$ readlink -f /run/current-system
+/nix/store/hf3d0wc91yyvky19f9k9rpvnbccavq90-darwin-system-26.11.57a3171
+$ ./bin/build.sh && readlink -f ./result
+/nix/store/hf3d0wc91yyvky19f9k9rpvnbccavq90-darwin-system-26.11.57a3171
+```
 
-The reboot test is likewise outstanding. `RunAtLoad = true` is present in Apple's own plist and
+The service is running, registered, and pointed at the current derivation — the recorded and
+desired install roots agree, so the drift branch correctly did not fire:
+
+```text
+$ container system status
+status             running
+installRoot        /nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2/
+$ launchctl list | grep 'apple.container\.'
+94988	0	com.apple.container.container-network-vmnet.default
+94990	0	com.apple.container.container-core-images
+94981	0	com.apple.container.apiserver
+94989	0	com.apple.container.machine-apiserver
+```
+
+Re-running the hook's logic in this steady state takes the no-op branch, which is what every
+future `darwin-rebuild switch` will do until the derivation changes:
+
+```text
+  [verbose] Apple Container apiserver already running against /nix/store/xapi2xhr...-container-1.2.2
+--- BRANCH TAKEN: needsStart=0
+```
+
+**What remains.** One item. The reboot test is still outstanding. `RunAtLoad = true` is present in Apple's own plist and
 the agent is registered in the `user/<uid>` domain, which persists across logins, so this is
 expected to pass — but the plan asked for it to be verified rather than assumed, and it has not
 been. If it turns out to fail, the recorded fallback stands: accept a manual
