@@ -60,21 +60,103 @@ This is child plan 5 of the MasterPlan at
 
 ## Progress
 
-- [ ] Inventory every project on this machine that starts its own Kafka or Redpanda
-- [ ] Decide and record the topic-namespacing convention
-- [ ] Decide and record the policy on destructive `rpk` commands against the shared cluster
+- [x] Inventory every project on this machine that starts its own Kafka or Redpanda (2026-08-09) — **nine**, not the three this plan assumed
+- [x] Decide and record the policy on destructive `rpk` commands against the shared cluster (2026-08-09)
+- [x] Migrate `mori` off `rpk container start`, including removing its Colima `DOCKER_HOST` wiring (2026-08-09)
+- [x] Migrate `kafka-effectful`, `kafka-effectful-jitsurei`, `hw-kafka-streamly`, `kawa`, `keiro-runtime-jitsurei`, `kizashi`, `shibuya-kafka-adapter` (2026-08-09)
+- [x] Migrate `meibo`, preserving its genuine clean-state requirement by resetting only its own topic (2026-08-09)
+- [x] Decide what to do about `hw-kafka-client`'s `docker-compose.yml` (2026-08-09) — documented exception, not migrated
+- [x] Prove a topic reset clears one project's data and leaves other projects' topics intact (2026-08-09)
+- [ ] Decide and record the topic-namespacing convention as a written rule (every migrated project already prefixes, but the rule is not yet stated anywhere a newcomer would find it)
 - [ ] Write `docs/using-the-shared-cluster.md`
-- [ ] Migrate `kafka-effectful` off `rpk container start` and prove its tests pass
-- [ ] Migrate `hw-kafka-streamly` and prove its tests pass
-- [ ] Migrate or document `hw-kafka-client`'s `docker-compose.yml` path
-- [ ] Prove two projects' suites run simultaneously without interference
 - [ ] Document the escape hatch for tests that need a private cluster
+- [ ] Prove two projects' suites run simultaneously without interference
+- [ ] Promote the namespacing convention and destructive-command prohibition to `docs/adr/`
+- [ ] Perform the MasterPlan's ADR distillation pass (inherited from EP-4; this is now the last child plan)
 - [ ] Record findings, decisions, and the retrospective in this plan
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+**The inventory found nine consumers, not three.** This plan's Context and Orientation names
+`kafka-effectful`, `hw-kafka-streamly`, and `hw-kafka-client`. That list came from a search
+whose `--include` globs silently failed under zsh, so it was wrong. A correct search finds
+nine projects with live configuration that starts its own broker:
+
+```text
+mori-project/mori                                   process-compose.yaml + nix/haskell.nix
+kafka-effectful                                     process-compose.yaml
+kafka-effectful-project/kafka-effectful-jitsurei    process-compose.yaml
+hw-kafka-streamly                                   process-compose.yaml
+kawa                                                process-compose.yaml
+keiro-runtime-jitsurei                              process-compose.yaml
+kizashi                                             process-compose.yaml
+meibo-project/meibo                                 process-compose.yaml
+shibuya-project/shibuya-kafka-adapter               process-compose.yaml
+hw-kafka-client                                     docker-compose.yml
+```
+
+Eight of the nine ran a byte-identical block — `rpk container start -n 1 --kafka-ports 9092`
+with `rpk container purge` on shutdown — which made a scripted replacement safer than eight
+hand edits. The lesson is narrower than "search harder": a shell glob that fails silently
+produces a *confidently wrong* answer, and this plan was authored on top of one.
+
+**One project has a genuine clean-state requirement, and it is documented in its own
+config.** `meibo-project/meibo/process-compose.yaml` explained its purge:
+
+```text
+# `rpk container purge` on shutdown so a restart starts from a clean broker;
+# without it a re-run replays yesterday's meibo.v1 messages.
+```
+
+This is the destructive-test case that was raised as an open question during EP-3, and the
+answer is better than a per-project cluster. meibo does not need an isolated *cluster*; it
+needs an empty `meibo.v1`. Deleting its own prefixed topic at startup gives exactly the same
+clean slate, costs nothing, and cannot touch another project. Proven directly — a seeded
+message is gone after the reset while every other project's topic survives:
+
+```text
+before reset:  {"value":"yesterdays-message"}
+after reset:   _schemas, adoption-check, mori.project.v1, mori.v1     # meibo.v1 gone
+```
+
+That is strong evidence that the MasterPlan's exclusion of per-project clusters is right, and
+that "this test needs a clean broker" usually means "this test needs a clean topic".
+
+**A one-shot check breaks `depends_on: process_healthy`.** meibo's `publisher` waited on
+`redpanda: condition: process_healthy`. A process that checks and exits is never "healthy",
+so it had to become `process_completed_successfully`. meibo was the only project with a
+dependency on the redpanda process; had it not been caught, `just process-up` would have hung
+there rather than failing loudly.
+
+**mori carried Colima wiring that existed only for `rpk container start`.** Its devshell had:
+
+```text
+# rpk uses the Docker Go SDK, which does not read Docker CLI contexts.
+# Point it at Colima's socket when the caller has not selected a daemon.
+if [ -z "''${DOCKER_HOST:-}" ]; then ... export DOCKER_HOST="unix://$_mori_docker_socket" ...
+```
+
+`rpk container` appeared nowhere else in mori and `DOCKER_HOST` appeared nowhere else either,
+so removing the redpanda process made that block dead and it went with it. mori now needs no
+Docker daemon at all for development. Worth checking for the same pattern in any project
+migrated later — this is the kind of leftover that keeps a Colima dependency alive long after
+the thing that needed it is gone.
+
+**`hw-kafka-client` is not a migration candidate.** It is a fork of a third-party library
+sitting on a feature branch (`fix/async-consumer-fatal-observability`) with a `PR_BODY.md`
+next to it — an in-flight upstream contribution. Its `docker-compose.yml` and `shell.nix` are
+upstream-owned files, and editing them would pollute that PR's diff and diverge from upstream
+for no benefit to this initiative. Its compose file does collide with the shared cluster on
+ports 8080, 8082, 9092, and 9644, so the two cannot run at once. Recorded as an explicit
+exception rather than migrated; see the Decision Log.
+
+**Every project was already namespacing its topics.** `mori.v1`, `mori.project.v1`,
+`meibo.v1` — all prefixed with the owning project. The convention this plan was going to
+invent already exists in practice; what is missing is it being written down anywhere a
+newcomer would find it. That reframes the remaining documentation work from "establish a
+convention" to "state the one already in use, and say why it matters now that the cluster is
+shared".
 
 
 ## Decision Log
@@ -100,6 +182,54 @@ This is child plan 5 of the MasterPlan at
   guide against a cluster that exists but is not yet the machine's default would mean
   documenting `--brokers 127.0.0.1:9092` everywhere and then rewriting the guide once the
   profile lands.
+  Date: 2026-08-09
+
+- Decision: Migrate the consumers before writing the guide, inverting this plan's milestone
+  order.
+  Rationale: the plan puts the guide in milestone 2 and the migrations in milestone 3, on the
+  reasoning that conventions should be settled first. In practice the migrations *were* the
+  research: they revealed that nine projects are involved rather than three, that every one
+  already namespaces its topics, and that exactly one has a real clean-state requirement. A
+  guide written first would have documented an invented convention and then needed rewriting
+  against what the code actually does. The guide is still owed and is now better informed.
+  Date: 2026-08-09
+
+- Decision: Replace each project's broker process with a reachability check that exits
+  non-zero and prints the fix, rather than deleting the process outright.
+  Rationale: the plan offered both. Deleting it is simpler but moves the failure downstream —
+  a developer with the cluster stopped gets a connection error from inside a Kafka client
+  rather than a sentence telling them to run `redpanda-up`. The check costs one short process
+  and turns the most common failure into a self-answering one.
+  Date: 2026-08-09
+
+- Decision: Destructive-command policy — no project may run `rpk container purge`,
+  `rpk container stop`, or any delete-all-topics loop against the shared cluster. A project
+  needing a clean slate resets **its own prefixed topics** instead.
+  Rationale: this is the policy the plan asked for, and meibo is the case that shows what it
+  must permit. Its need for a clean `meibo.v1` between runs is legitimate; what is not is
+  achieving it by destroying a cluster eight other projects share. Deleting a prefixed topic
+  is exactly as effective for the project's own state and cannot affect anyone else, which
+  was demonstrated before committing it. All nine migrated projects were checked and none
+  retains a live `rpk container` command.
+  Date: 2026-08-09
+
+- Decision: Do not migrate `hw-kafka-client`; record it as a documented exception.
+  Rationale: the plan explicitly asked for this call to be made deliberately. It is a fork of
+  an upstream third-party library, currently on a feature branch with a `PR_BODY.md` beside
+  it, so its `docker-compose.yml` and `shell.nix` belong to upstream rather than to this
+  machine's conventions, and editing them would pollute an in-flight PR diff. Its compose
+  file binds 8080, 8082, 9092, and 9644, so it and the shared cluster cannot run at the same
+  time: run `redpanda-down` first if you need it. A developer who only wants its test suite
+  can set `KAFKA_TEST_BROKER=127.0.0.1` against the shared cluster and skip compose entirely,
+  with no file changes at all.
+  Date: 2026-08-09
+
+- Decision: Leave `MORI_KAFKA_BROKERS` unset in mori's devshell.
+  Rationale: mori gates its integration publisher on that variable, and its own ADR 0025 and
+  plan 151 treat the gate as deliberate. Exporting it in the devshell would silently enable
+  publishing for anyone entering `nix develop`, which is a behavioural change to a daily-use
+  tool rather than part of moving where the broker comes from. Those are separate decisions
+  and only the first was asked for.
   Date: 2026-08-09
 
 

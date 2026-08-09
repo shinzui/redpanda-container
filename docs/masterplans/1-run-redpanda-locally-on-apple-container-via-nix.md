@@ -186,7 +186,7 @@ the `just status-*` / `restart-*` / `logs-*` recipe families, and the Caddy
 | 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Complete |
 | 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Complete |
 | 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | In Progress |
-| 5 | Document how projects use the shared Redpanda for testing | docs/plans/5-document-how-projects-use-the-shared-redpanda-for-testing.md | EP-4 | EP-2 | Not Started |
+| 5 | Document how projects use the shared Redpanda for testing | docs/plans/5-document-how-projects-use-the-shared-redpanda-for-testing.md | EP-4 | EP-2 | In Progress |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 Hard Deps and Soft Deps reference other rows by their # prefix (e.g., EP-1, EP-3).
@@ -367,10 +367,12 @@ candidate**, alongside the store-path drift constraint EP-1 discovered.
 - [x] EP-4: Console reachable via `redpanda.localhost` and showing topics; runbook and rollback documented (2026-08-09)
 - [x] EP-4: `docs/local-services.md` updated (2026-08-09)
 - [ ] EP-4: a full boot with Colima never started is verified — blocked on a reboot; also closes EP-1's outstanding item
-- [ ] EP-5: consumer inventory redone; topic namespacing convention and destructive-command policy decided
-- [ ] EP-5: `docs/using-the-shared-cluster.md` written and self-contained for a reader with no context
-- [ ] EP-5: `kafka-effectful` and `hw-kafka-streamly` migrated off their own brokers; `hw-kafka-client` migrated or documented as an exception
+- [x] EP-5: consumer inventory redone (2026-08-09) — nine projects, not three; destructive-command policy decided
+- [x] EP-5: all nine `process-compose` consumers migrated off their own brokers (2026-08-09); `hw-kafka-client` documented as an exception
+- [x] EP-5: meibo's genuine clean-state requirement preserved by resetting only its own topic, proven not to affect other projects (2026-08-09)
+- [ ] EP-5: topic namespacing convention written down; `docs/using-the-shared-cluster.md` self-contained for a reader with no context
 - [ ] EP-5: two projects' test suites proven to run simultaneously without interference, Colima stopped
+- [ ] EP-5: ADR distillation pass for the whole MasterPlan (inherited from EP-4)
 
 
 ## Surprises & Discoveries
@@ -600,6 +602,27 @@ system activation script. The only `sudo` in the initiative is `darwin-rebuild s
 bootstraps a newly registered agent immediately and `RunAtLoad` fires it, so the
 already-running branch of `redpanda-up` gets tested under launchd rather than under an
 interactive shell — which is where it actually has to work.
+
+
+### Discovered during EP-5 (2026-08-09)
+
+**The initiative had three times as many consumers as assumed.** Nine projects on this
+machine started their own broker, not the three EP-5 was authored against — the original
+search used shell globs that failed silently, producing a confidently wrong list. All nine
+are now migrated except `hw-kafka-client`, which is a fork of an upstream library with an
+in-flight PR and is recorded as a deliberate exception.
+
+**"Needs a clean broker" turned out to mean "needs a clean topic".** `meibo` was the one
+project with a documented clean-state requirement, and it was met by deleting its own
+prefixed topic at startup rather than by giving it a private cluster. Verified: the reset
+clears `meibo.v1` and leaves every other project's topics intact. This is direct evidence
+for the MasterPlan's exclusion of per-project clusters, and it resolves the question raised
+during EP-3 about whether destructive tests would force one. Integration Point 7's policy is
+now settled: reset your own prefixed topics, never purge the cluster.
+
+**Topic namespacing was already universal practice.** Every consumer already prefixed its
+topics with the owning project (`mori.v1`, `meibo.v1`). The convention did not need
+inventing, only writing down — which is what remains of EP-5's documentation work.
 
 
 ## Revision Notes
