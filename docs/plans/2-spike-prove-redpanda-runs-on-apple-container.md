@@ -60,25 +60,92 @@ This is child plan 2 of the MasterPlan at
 
 ## Progress
 
-- [ ] Confirm the prerequisites from plan 1 hold (`container` installed, service running, networks available)
-- [ ] Experiment A: pull the Redpanda and Console images
-- [ ] Experiment B: create a user-defined network and prove two containers can reach each other
-- [ ] Experiment C: determine the exact working name string for container-to-container addressing
-- [ ] Experiment D: create a named volume, write to it, delete the container, recreate, verify data survived
-- [ ] Experiment E: start a single Redpanda broker in `dev-container` mode with a named volume
-- [ ] Experiment F: produce and consume from macOS through the published Kafka port
-- [ ] Experiment G: verify Admin API, Schema Registry, and HTTP Proxy from macOS
-- [ ] Experiment H: start Console and verify it sees the broker and topics
-- [ ] Experiment I: verify data persistence across a full stop/start of the broker container
-- [ ] Experiment J: verify labels and JSON output are usable for status and cleanup
-- [ ] Write `docs/spikes/1-apple-container-redpanda-findings.md`
-- [ ] Record the internal-addressing decision in the Decision Log
-- [ ] Tear down every resource created by the spike and verify nothing is left behind
+All experiments complete, 2026-08-08. Two experiments were added that the plan did not
+anticipate (B2 and H2); both are recorded in the findings document.
+
+- [x] Confirm the prerequisites from plan 1 hold (`container` installed, service running, networks available) (2026-08-08)
+- [x] Experiment A: pull the Redpanda and Console images (2026-08-08) — required a registry change and an explicit `--platform`
+- [x] Experiment B: create a user-defined network and prove two containers can reach each other (2026-08-08)
+- [x] Experiment B2 (added): establish that container-to-container networking degrades and that a runtime restart repairs it (2026-08-08)
+- [x] Experiment C: determine the exact working name string for container-to-container addressing (2026-08-08) — **no name string resolves**; a bind-mounted `/etc/hosts` is the answer
+- [x] Experiment D: create a named volume, write to it, delete the container, recreate, verify data survived (2026-08-08)
+- [x] Experiment E: start a single Redpanda broker in `dev-container` mode with a named volume (2026-08-08) — required chowning the volume to `101:101`
+- [x] Experiment F: produce and consume from macOS through the published Kafka port (2026-08-08)
+- [x] Experiment G: verify Admin API, Schema Registry, and HTTP Proxy from macOS (2026-08-08)
+- [x] Experiment H: start Console and verify it sees the broker and topics (2026-08-08)
+- [x] Experiment H2 (added): establish that Console breaks when the broker's IP changes, and verify the remediation (2026-08-08)
+- [x] Experiment I: verify data persistence across a full stop/start *and* full delete/recreate of the broker container (2026-08-08)
+- [x] Experiment J: verify labels and JSON output are usable for status and cleanup (2026-08-08)
+- [x] Write `docs/spikes/1-apple-container-redpanda-findings.md` (2026-08-08)
+- [x] Record the internal-addressing decision in the Decision Log (2026-08-08)
+- [x] Tear down every resource created by the spike and verify nothing is left behind (2026-08-08)
+- [ ] Optional cleanup left to the user: `sudo container system dns delete test` removes the DNS domain created during Experiment C, which proved useless and is not needed by any later plan
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+Full transcripts for all of these are in
+`docs/spikes/1-apple-container-redpanda-findings.md`; this section records what was
+surprising and why it mattered.
+
+**Container-to-container name resolution does not work at all.** The plan expected one of
+three name forms to work and framed the experiment as "determine which". The answer is
+none. Bare names fail, `--dns-domain` alone fails, and a domain registered with
+`sudo container system dns create test` fails too — the embedded resolver answers NXDOMAIN.
+Retested after restarting the runtime and recreating both containers so neither predated
+the domain. Containers on the *default* network cannot resolve each other either, so it is
+not a user-defined-network limitation. Reading `/etc/resolver/containerization.test`
+explains why: `container system dns create` writes a **macOS-side** resolver pointing at a
+host DNS service on `127.0.0.1:2053`; it is for resolving containers *from macOS*, not for
+container-to-container resolution.
+
+This invalidated the plan's assumption that its three candidates were exhaustive. The
+solution actually used — bind-mounting a hosts file over `/etc/hosts` — was not among them.
+
+**The `sudo` question the plan asked has an inverted answer.** The plan asked whether a
+`sudo container system dns create` step must go in plan 4's runbook. It must not: it was
+tested and does not help. Answering "no" here is more valuable than answering "yes" would
+have been, because it removes a privileged step from the setup instructions.
+
+**Networking degraded mid-spike and a runtime restart repaired it.** Connectivity that had
+been demonstrated working stopped working entirely — 100% packet loss between containers,
+including freshly created ones. The initial hypothesis was that publishing ports caused it,
+since the broker published four and the working pair published none. That was tested
+directly and disproved: with networking degraded, a container with a published port and one
+without were equally unreachable. `container system stop && container system start` restored
+it completely. The MasterPlan had recorded community reports of this after host sleep/wake;
+it happened here with no sleep involved, so plan 3 should treat it as ordinary rather than
+exotic.
+
+**The Redpanda image cannot use a fresh named volume without a chown.** The broker died on
+startup with `mkdir failed: Permission denied ["/var/lib/redpanda/data/crash_reports"]`. The
+image runs as `uid=101(redpanda)` and ships that directory owned by 101, but an Apple
+Container named volume mounts root-owned and masks it. A single
+`chown -R 101:101` on the volume fixes it permanently. This is exactly the class of problem
+the plan predicted would be miserable to debug through launchd logs later.
+
+**Apple Container pulled the wrong architecture by default.** For the multi-arch
+`redpandadata/redpanda:v26.2.1`, it selected `linux/amd64` on this arm64 machine. Nothing
+warns about this; the container would simply have run under emulation. `--platform
+linux/arm64` on both `pull` and `run` fixes it.
+
+**`docker.redpanda.com` rate-limited every attempt.** Persistent HTTP 429 across several
+minutes and multiple retries. Docker Hub carries the same images and worked. A related trap:
+piping `container image pull` into `tail` masks its exit status, which briefly made a failed
+pull look successful — the command genuinely does exit 1 on failure.
+
+**Container IPs are not stable, and Console does not tolerate that.** A single broker
+container held `.5`, `.4`, then `.8` across the spike. Because the hosts-file workaround
+freezes the IP at Console start time, recreating the broker left Console dialling a dead
+address and returning HTTP 500 from `/api/topics`. Regenerating the hosts file and
+restarting Console fixed it. This makes "restart the broker" an unsupported standalone
+operation for plan 3.
+
+**`container network list` has no `STATE` column**, contrary to plan 1's prediction. Actual
+columns are `NETWORK  SUBNET`.
+
+**`container list` has no server-side label filtering**, so status and purge scripts must
+list everything and filter `.configuration.labels` with `jq`.
 
 
 ## Decision Log
@@ -101,10 +168,100 @@ This is child plan 2 of the MasterPlan at
   is the last resort.
   Date: 2026-08-08
 
+- Decision: **The internal addressing decision (MasterPlan Integration Point 3).** The broker
+  advertises the fixed container name `redpanda-0`; Console resolves that name through a
+  hosts file generated on macOS at start time from the broker's discovered IP and
+  bind-mounted over `/etc/hosts` in Console's container.
+  Rationale: all three candidates the plan enumerated were tested and all three failed. Bare
+  and domain-qualified names do not resolve even with a registered DNS domain, and a raw IP
+  cannot be used because the broker's advertised address is fixed at `container run` time —
+  before the container has an IP — and because IPs change on every restart. Mounting a hosts
+  file keeps a *stable name* in the advertised address, which is what Kafka's metadata
+  exchange needs, while letting the actual address be resolved late. It was chosen over the
+  alternative of running Console's entrypoint as root and appending to `/etc/hosts` in-process
+  because the mount works for the image's normal non-root user (`uid=100`), needs no
+  entrypoint override, and keeps the config file mountable by the same mechanism.
+  Date: 2026-08-08
+
+- Decision: Pull images from `docker.io/redpandadata/...` rather than
+  `docker.redpanda.com/redpandadata/...`, and always pass `--platform linux/arm64`.
+  Rationale: the documented registry rate-limited every attempt with HTTP 429 over several
+  minutes. Docker Hub serves the same images. The explicit platform is required because
+  Apple Container selected the `linux/amd64` variant of the multi-arch image on this arm64
+  machine, which would have run Redpanda under emulation silently.
+  Date: 2026-08-08
+
+- Decision: Chown the data volume to `101:101` as part of creating it, rather than running
+  the broker as root or using a bind mount from macOS.
+  Rationale: the image runs as `uid=101(redpanda)` and a fresh Apple Container named volume
+  mounts root-owned, which masks the image's correctly-owned data directory and kills the
+  broker at startup. A one-time chown is the smallest change, preserves the image's own
+  security posture, and persists because the volume persists.
+  Date: 2026-08-08
+
+- Decision: Treat "restart the broker" as an unsupported standalone operation; anything that
+  restarts the broker must also regenerate the hosts file and restart Console.
+  Rationale: the broker's IP changes on every restart, and Console's mounted hosts file
+  freezes the IP at Console start time. This was observed and the remediation verified.
+  Plan 3's `redpanda-up` must therefore order its work: start broker, wait for ready, read
+  IP, write hosts file, start Console.
+  Date: 2026-08-08
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+**What was achieved.** Redpanda and Redpanda Console both run on Apple Container, and the
+MasterPlan's design is achievable. The behavioural acceptance was observed directly, with
+Colima not running:
+
+```text
+$ echo "hello" | rpk topic produce spike-test --brokers 127.0.0.1:9092
+Produced to partition 0 at offset 0 with timestamp 1786242553203.
+$ rpk topic consume spike-test -n 1 --brokers 127.0.0.1:9092
+{"topic":"spike-test","value":"hello","timestamp":1786242553203,"partition":0,"offset":0}
+```
+
+and Console served HTTP 200 on `127.0.0.1:8080` while listing `spike-test`, proving it
+reached the broker over the container network on the `internal` listener at the same time
+`rpk` was using the `external` one. Data survived both a stop/start and a full
+delete-and-recreate of the broker container against the same named volume. The findings
+document `docs/spikes/1-apple-container-redpanda-findings.md` contains real transcripts for
+all twelve experiments and answers every acceptance question the plan posed. All spike
+resources were torn down and verified gone.
+
+**What changed relative to the plan.** The plan framed Experiment C as choosing among three
+name forms. All three failed, so the deliverable became a mechanism the plan had not
+considered: a bind-mounted `/etc/hosts` file. Two experiments were added — B2 (networking
+degradation) and H2 (Console breaking on IP change) — because both were discovered while
+diagnosing failures and both constrain plan 3's design. Four findings that the plan did not
+anticipate at all (registry rate limiting, wrong default architecture, volume ownership,
+networking fragility) would each individually have cost a debugging cycle inside a launchd
+agent, which is precisely the outcome this spike existed to prevent.
+
+**Lessons worth carrying forward.** The plan's instruction to isolate variables paid for
+itself twice. Using plain Alpine containers for the networking and volume experiments meant
+that when the broker later failed, "Redpanda is misconfigured" could be separated from
+"networking is broken" immediately. And when Console could not reach the broker, testing a
+published-port container against a non-published one disproved the obvious hypothesis in one
+command — without that, the port-publishing theory would have been plausible enough to build
+a workaround around, and the workaround would not have helped.
+
+The second lesson is that reading the artifact a tool generates beats trusting its
+documentation. Apple's tutorial implies `container system dns create` enables container name
+resolution; `cat /etc/resolver/containerization.test` shows in four lines that it configures
+macOS-side resolution instead. That file explained a failure that three rounds of retrying
+had not.
+
+**Bearing on later plans.** Plan 3 must render: the `docker.io` registry with
+`--platform linux/arm64`; a volume chowned to `101:101`; `--advertise-kafka-addr
+internal://redpanda-0:9092,external://127.0.0.1:9092`; a generated hosts file mounted into
+Console; a readiness poll on `http://127.0.0.1:9644/v1/status/ready`; and a strict start
+order of broker → ready → read IP → write hosts → Console. It must not assume the broker can
+be restarted independently of Console, and it should verify container-to-container
+connectivity rather than assume it. Plan 4 must **not** include a
+`sudo container system dns create` step in the runbook, and should document
+`container system stop && container system start` as the remedy when Console cannot reach the
+broker.
 
 
 ## Context and Orientation

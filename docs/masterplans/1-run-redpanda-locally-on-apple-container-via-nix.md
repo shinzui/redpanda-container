@@ -175,7 +175,7 @@ the `just status-*` / `restart-*` / `logs-*` recipe families, and the Caddy
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
 | 1 | Package Apple Container at its latest release in Nix | docs/plans/1-package-apple-container-at-its-latest-release-in-nix.md | None | None | In Progress |
-| 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Not Started |
+| 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Complete |
 | 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Not Started |
 | 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | Not Started |
 
@@ -257,18 +257,35 @@ own labels (`cluster-id=redpanda`, `node-id=<n>`) so that a cluster started by
 `rpk container start` under Docker and a cluster started by this module are never
 confused for one another. This contract is the first ADR candidate.
 
-**3. The internal addressing decision.** EP-2 discovers it, EP-3 consumes it. The question
-is what the broker should advertise as its *internal* Kafka, Schema Registry, and Admin
-addresses — the addresses Console uses to reach the broker from inside its own container.
-The candidates, in the order EP-2 must test them, are the bare container name
-(`redpanda-0:9092`), the name qualified by Apple Container's DNS domain
-(`redpanda-0.test:9092` or whatever `container system property list` reports as the
-default domain), and an IP address read from `container inspect redpanda-0`. A fourth
-fallback exists if container-to-container networking proves unreliable: publish the broker
-ports to the host and point Console at a `--localhost` DNS domain created with
-`sudo container system dns create host.container.internal --localhost 203.0.113.113`,
-which the Apple Container documentation describes for reaching host services from a
-container. EP-2 must record which option it verified and EP-3 must render that option.
+**3. The internal addressing decision — RESOLVED by EP-2 on 2026-08-08.** EP-3 consumes
+this; the full evidence is in `docs/spikes/1-apple-container-redpanda-findings.md`.
+
+The broker advertises the **fixed container name** `redpanda-0`, and Console resolves that
+name through a hosts file generated on macOS at start time from the broker's discovered IP
+and bind-mounted over `/etc/hosts` in Console's container:
+
+```text
+--advertise-kafka-addr internal://redpanda-0:9092,external://127.0.0.1:9092
+container run ... -v <generated-hosts-file>:/etc/hosts ... <console-image>
+```
+
+None of the three candidates originally listed here work. **Container-to-container name
+resolution does not exist on Apple Container 1.2.2**: bare names fail, `--dns-domain` alone
+fails, and a domain registered with `sudo container system dns create` fails too — that
+command writes a *macOS-side* resolver (`/etc/resolver/containerization.test` pointing at
+`127.0.0.1:2053`) for resolving containers **from** macOS, not between containers. A raw IP
+cannot be used either, because the advertised address is fixed at `container run` time,
+before the container has an IP, and because IPs change on every restart.
+
+Two consequences bind EP-3 and EP-4:
+
+- **EP-3 must start things in a strict order**: start the broker, poll it ready, read its IP
+  with `container inspect redpanda-0 | jq -r '.[0].status.networks[0].ipv4Address' | cut -d/ -f1`,
+  write the hosts file, then start Console. Restarting the broker alone leaves Console
+  dialling a dead address; anything that restarts the broker must restart Console too.
+- **EP-4 must NOT put a `sudo container system dns create` step in the runbook.** The
+  original wording of this integration point anticipated needing one. It is not needed and
+  would not help.
 
 **4. The host port contract.** EP-3 owns it as module option defaults; EP-4 consumes it
 when generating the `rpk` profile and when deciding whether to add a Caddy entry.
@@ -307,10 +324,10 @@ candidate.
 - [x] EP-1: the overlay exposes it and `home/default.nix` installs it (2026-08-08)
 - [x] EP-1: a Linux container runs with Colima stopped, and `container network list` confirms user-defined networks (2026-08-08)
 - [ ] EP-1: `container system start` runs at login and `container system status` reports healthy — module activated and verified running against the current derivation (2026-08-08); the login/reboot half is still unverified pending a reboot
-- [ ] EP-2: image pull, named volume, and port publishing verified with recorded transcripts
-- [ ] EP-2: Redpanda starts in `dev-container` mode and Kafka is reachable from the macOS host
-- [ ] EP-2: container-to-container networking and name resolution verified; internal addressing decided
-- [ ] EP-2: volume persistence across container deletion verified; findings written up
+- [x] EP-2: image pull, named volume, and port publishing verified with recorded transcripts (2026-08-08)
+- [x] EP-2: Redpanda starts in `dev-container` mode and Kafka is reachable from the macOS host (2026-08-08)
+- [x] EP-2: container-to-container networking and name resolution verified; internal addressing decided (2026-08-08) — no name resolution exists; bind-mounted `/etc/hosts` chosen
+- [x] EP-2: volume persistence across container deletion verified; findings written up (2026-08-08)
 - [ ] EP-3: flake skeleton exports `homeManagerModules.redpanda-container`
 - [ ] EP-3: module renders `redpanda-up` / `redpanda-down` / `redpanda-status` / `redpanda-logs` / `redpanda-purge`
 - [ ] EP-3: launchd agent starts the cluster at login and readiness polling works
@@ -396,7 +413,47 @@ kernel live there, not in the store, so it is not reproducible from the flake. E
 rollback instructions must account for it, and EP-2's volume-persistence findings will be about
 that directory.
 
-**Apple Container has an embedded DNS service, but its guarantees are thin.** The
+### Discovered during EP-2 (2026-08-08)
+
+Full transcripts in `docs/spikes/1-apple-container-redpanda-findings.md`.
+
+**Container-to-container name resolution does not exist, so the "embedded DNS" note below
+is superseded.** It is not merely thin — it is absent. This invalidated the assumption,
+carried in the pre-implementation note below and in Integration Point 3, that one of several
+name forms would work. See the resolved Integration Point 3 for the mechanism EP-3 must use
+instead.
+
+**Apple Container's networking degrades and a runtime restart repairs it.** Container-to-
+container connectivity that had been demonstrated working stopped working entirely, then was
+fully restored by `container system stop && container system start`. The obvious hypothesis
+— that publishing ports caused it — was tested and disproved. This affects EP-3 (verify
+connectivity, do not assume it) and EP-4 (document the restart as the remedy).
+
+**The Redpanda image needs its volume chowned to `101:101`.** The image runs as
+`uid=101(redpanda)`; a fresh Apple Container named volume mounts root-owned and masks the
+image's data directory, killing the broker at startup. EP-3 must chown as part of volume
+creation. This is new information for Integration Point 2, which named the volume but said
+nothing about its ownership.
+
+**Images must be pulled from Docker Hub with an explicit `--platform linux/arm64`.**
+`docker.redpanda.com` rate-limited persistently (HTTP 429), and Apple Container selected the
+`linux/amd64` variant of the multi-arch image on this arm64 machine, which would run the
+broker under emulation. EP-3 must render both the registry and the platform flag.
+
+**Console must be restarted whenever the broker restarts**, because broker IPs change on
+every restart and the generated hosts file freezes the IP at Console start time. This makes
+"restart the broker" an unsupported standalone operation and constrains EP-3's script design.
+
+**`container` JSON has no server-side label filtering**, so EP-3's `redpanda-status` and
+`redpanda-purge` must list everything and filter `.configuration.labels` with `jq`. The
+useful paths are `.configuration.id`, `.status.state`,
+`.status.networks[0].ipv4Address`, `.configuration.image.reference`, and
+`.configuration.labels`.
+
+### Recorded before implementation began
+
+**Apple Container has an embedded DNS service, but its guarantees are thin.** (Superseded by
+EP-2 — resolution does not work at all; see above.) The
 `container` tutorial shows `container run -it --rm web-test curl http://my-web-server.test`
 resolving one container from another after `sudo container system dns create test`, and
 `container run` accepts `--dns-domain`. Community reports describe container-to-container
