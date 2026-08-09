@@ -178,6 +178,7 @@ the `just status-*` / `restart-*` / `logs-*` recipe families, and the Caddy
 | 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Complete |
 | 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Not Started |
 | 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | Not Started |
+| 5 | Document how projects use the shared Redpanda for testing | docs/plans/5-document-how-projects-use-the-shared-redpanda-for-testing.md | EP-4 | EP-2 | Not Started |
 
 Status values: Not Started, In Progress, Complete, Cancelled.
 Hard Deps and Soft Deps reference other rows by their # prefix (e.g., EP-1, EP-3).
@@ -199,6 +200,9 @@ EP-3 (Flake + home-manager module)
    │  provides: services.redpanda-container module + wrapper scripts
    ▼
 EP-4 (Adoption in dotfiles, rpk profile, runbook)
+   │  provides: an rpk profile resolving from any directory; the machine actually uses it
+   ▼
+EP-5 (Consumer guide + migrating projects off their own brokers)
 ```
 
 **EP-2 hard-depends on EP-1** because the spike runs `container` commands. There is no way
@@ -219,10 +223,17 @@ attribute name.
 to import until then. It soft-depends on EP-1 because the dotfiles overlay that EP-1 adds
 must already be in place for the module's default `package` to resolve.
 
+**EP-5 hard-depends on EP-4** because its guide instructs readers to use bare `rpk` commands
+that resolve through the profile EP-4 generates; without it the guide would have to spell
+out `--brokers 127.0.0.1:9092` everywhere and be rewritten once the profile landed. It
+soft-depends on EP-2 because the guide restates the spike's readiness check and its
+`container system stop && container system start` remedy for degraded networking.
+
 **Nothing runs in parallel.** If a second contributor were available, the only genuinely
-independent slice is the documentation portion of EP-4 (updating
+independent slices are the documentation portion of EP-4 (updating
 `/Users/shinzui/Keikaku/dotfiles.nix/docs/local-services.md` and writing the runbook),
-which can be drafted while EP-3 is in flight and corrected afterwards.
+which can be drafted while EP-3 is in flight and corrected afterwards, and EP-5's consumer
+inventory (milestone 1), which only reads other repositories and can be done at any time.
 
 
 ## Integration Points
@@ -317,6 +328,16 @@ contributor reading `docs/initial-spec.md` alongside this MasterPlan will otherw
 assume the abstraction was forgotten rather than declined. This is the second ADR
 candidate.
 
+**7. The topic namespacing convention and the destructive-command prohibition.** EP-5 owns
+both; every consuming project depends on them. Because the cluster is shared, two projects
+that both create a topic named `source` write to the same topic, and a suite that cleans up
+by deleting all topics — or by calling `rpk container purge` — destroys other projects' data.
+`/Users/shinzui/Keikaku/bokuno/kafka-effectful` today does both: its `Justfile` uses bare
+topic names including `source` and `destination`, and its `process-compose.yaml` runs
+`rpk container purge` as a shutdown hook. EP-5 must fix these and publish the convention
+where a contributor in an unrelated repository will find it. This is the **fourth ADR
+candidate**, alongside the store-path drift constraint EP-1 discovered.
+
 
 ## Progress
 
@@ -336,6 +357,10 @@ candidate.
 - [ ] EP-4: `rpk` profile generated; produce/consume works from at least two unrelated project directories
 - [ ] EP-4: Console reachable and showing topics; runbook and rollback documented
 - [ ] EP-4: `docs/local-services.md` updated; a full boot with Colima never started is verified
+- [ ] EP-5: consumer inventory redone; topic namespacing convention and destructive-command policy decided
+- [ ] EP-5: `docs/using-the-shared-cluster.md` written and self-contained for a reader with no context
+- [ ] EP-5: `kafka-effectful` and `hw-kafka-streamly` migrated off their own brokers; `hw-kafka-client` migrated or documented as an exception
+- [ ] EP-5: two projects' test suites proven to run simultaneously without interference, Colima stopped
 
 
 ## Surprises & Discoveries
@@ -543,3 +568,40 @@ sleep/wake failure mode rather than assume it away.
 ## Outcomes & Retrospective
 
 (To be filled during and after implementation.)
+
+
+## Revision Notes
+
+**2026-08-09 — Added EP-5, "Document how projects use the shared Redpanda for testing".**
+
+The original decomposition stopped at EP-4, which makes *this machine* use the shared
+cluster. It did not cover what every *other* repository should do about it, and EP-2's
+research surfaced that this is not a small matter: three projects on this machine
+(`/Users/shinzui/Keikaku/bokuno/kafka-effectful`,
+`/Users/shinzui/Keikaku/bokuno/hw-kafka-streamly`, and
+`/Users/shinzui/Keikaku/bokuno/hw-kafka-client`) each start their own broker, all bind host
+port 9092, and all therefore require Colima. Two of them drive it through `rpk container
+start`, which is the exact dependency this initiative removes. One of them runs
+`rpk container purge` as a shutdown hook — safe against a private cluster, destructive
+against a shared one.
+
+Folding this into EP-4 was considered and rejected. EP-4 changes machine configuration and
+its failure mode is a broken `darwin-rebuild switch`; EP-5 changes other repositories and its
+failure mode is a broken test suite. They have different audiences — an operator versus
+whoever writes tests, including coding agents arriving with no context — and EP-4 was already
+carrying seven progress items, so absorbing a cross-repository migration would have made it
+the plan doing most of the work, which the decomposition principles in
+`agents/skills/master-plan/MASTERPLAN.md` warn against.
+
+EP-5 hard-depends on EP-4 for the `rpk` profile and soft-depends on EP-2 for the readiness
+check and the networking-degradation remedy. The Dependency Graph, Integration Points (new
+point 7), Progress, and Exec-Plan Registry were all updated. The initiative now has five
+child plans, still within the two-to-seven range, and remains a serial chain.
+
+**2026-08-08 — Integration Point 3 resolved by EP-2.** The original text listed three
+candidate mechanisms for container-to-container addressing and instructed EP-2 to pick one.
+All three were tested and all three failed; the section now records the mechanism actually
+verified (a bind-mounted `/etc/hosts` file) and reverses the guidance it previously gave
+EP-4 about needing a `sudo container system dns create` step in the runbook. The
+Surprises & Discoveries section gained an EP-2 subsection, and the pre-implementation note
+about Apple Container's embedded DNS is now explicitly marked superseded.
