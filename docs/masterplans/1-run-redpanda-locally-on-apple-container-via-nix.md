@@ -174,7 +174,7 @@ the `just status-*` / `restart-*` / `logs-*` recipe families, and the Caddy
 
 | # | Title | Path | Hard Deps | Soft Deps | Status |
 |---|-------|------|-----------|-----------|--------|
-| 1 | Package Apple Container at its latest release in Nix | docs/plans/1-package-apple-container-at-its-latest-release-in-nix.md | None | None | Not Started |
+| 1 | Package Apple Container at its latest release in Nix | docs/plans/1-package-apple-container-at-its-latest-release-in-nix.md | None | None | In Progress |
 | 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Not Started |
 | 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Not Started |
 | 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | Not Started |
@@ -303,9 +303,10 @@ candidate.
 
 ## Progress
 
-- [ ] EP-1: `derivations/apple-container.nix` builds Apple Container 1.2.2 and `container --version` reports it
-- [ ] EP-1: the overlay exposes it and `home/default.nix` installs it
-- [ ] EP-1: `container system start` runs at login and `container system status` reports healthy
+- [x] EP-1: `derivations/apple-container.nix` builds Apple Container 1.2.2 and `container --version` reports it (2026-08-08)
+- [x] EP-1: the overlay exposes it and `home/default.nix` installs it (2026-08-08)
+- [x] EP-1: a Linux container runs with Colima stopped, and `container network list` confirms user-defined networks (2026-08-08)
+- [ ] EP-1: `container system start` runs at login and `container system status` reports healthy — mechanism written and its logic verified against the live service, but not yet activated (`sudo darwin-rebuild` needs interactive auth) and not yet reboot-tested
 - [ ] EP-2: image pull, named volume, and port publishing verified with recorded transcripts
 - [ ] EP-2: Redpanda starts in `dev-container` mode and Kafka is reachable from the macOS host
 - [ ] EP-2: container-to-container networking and name resolution verified; internal addressing decided
@@ -358,6 +359,42 @@ $ nix store prefetch-file --json --hash-type sha256 \
 reach each other at all. On macOS 26 both work. Had this machine been on macOS 15, the
 entire multi-container design — broker plus Console on a shared network — would have been
 impossible and the decomposition would have needed a different Console strategy.
+
+### Discovered during EP-1 (2026-08-08)
+
+**Apple Container's launch agent lives in the `user/<uid>` launchd domain, not `gui/<uid>`.**
+Every other service on this machine is a `home-manager` agent in `gui/<uid>` per
+`/Users/shinzui/Keikaku/dotfiles.nix/docs/local-services.md`. Apple Container's is not:
+`container system start` writes its own plist to
+`~/Library/Application Support/com.apple.container/apiserver/apiserver.plist` and bootstraps it
+into `user/<uid>`, so `launchctl print gui/501/com.apple.container.apiserver` fails outright.
+EP-3 must keep the two straight: its *own* Redpanda agent is a normal `home-manager` `gui/`
+agent, but any code that inspects or waits on the Apple Container API server must use `user/`.
+
+**The API server registration freezes a Nix store path, so package upgrades silently rot it.**
+The plist Apple writes hard-codes the store path into both `ProgramArguments[0]` and
+`CONTAINER_INSTALL_ROOT`. After the derivation is bumped, the old apiserver keeps running from
+the superseded path — giving version skew first and a dead agent once that path is
+garbage-collected — and a liveness-only health check never notices, because something *is*
+running. EP-1 solved this with an activation hook that compares recorded against desired install
+root and re-registers on drift. This is a genuine architectural constraint about self-registering
+third-party daemons on an immutable store, and it is a **third ADR candidate** alongside the two
+already listed in the ADR context section; it should be written during the completion distillation
+pass.
+
+**`container system status` exits 0 when running and 1 when not**, making it a reliable readiness
+probe. EP-3's launchd agent should poll it rather than assume the API server is up — which also
+covers the sleep/wake unreliability noted below.
+
+**`container network list` has no `STATE` column** on 1.2.2, contrary to what EP-1's validation
+section predicted. Actual output is `NETWORK  SUBNET` / `default  192.168.64.0/24`. EP-2 must not
+parse for a state column that does not exist.
+
+**`CONTAINER_APP_ROOT` is mutable state outside the Nix store**, at
+`~/Library/Application Support/com.apple.container`. Images, volumes, and the installed Linux
+kernel live there, not in the store, so it is not reproducible from the flake. EP-4's purge and
+rollback instructions must account for it, and EP-2's volume-persistence findings will be about
+that directory.
 
 **Apple Container has an embedded DNS service, but its guarantees are thin.** The
 `container` tutorial shows `container run -it --rm web-test curl http://my-web-server.test`

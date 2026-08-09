@@ -58,20 +58,167 @@ exists.
 
 ## Progress
 
-- [ ] Write `derivations/apple-container.nix` in the dotfiles repository, pinned to 1.2.2
-- [ ] Expose it through the `my-packages` overlay as the attribute `container`
-- [ ] Add `container` to `home.packages` in `home/default.nix`
-- [ ] Verify the derivation builds in isolation with `nix build`
-- [ ] Run `darwin-rebuild switch` and confirm `container --version` reports 1.2.2
-- [ ] Add a `home-manager` activation or launchd arrangement that runs `container system start`
-- [ ] Confirm the service survives a logout/login (or a reboot) without manual intervention
-- [ ] Confirm `container run --rm ... echo` works with Colima stopped
-- [ ] Record findings, decisions, and the retrospective in this plan
+Milestone 1 — the derivation and its installation (complete, 2026-08-08):
+
+- [x] Write `derivations/apple-container.nix` in the dotfiles repository, pinned to 1.2.2 (2026-08-08)
+- [x] Expose it through the `my-packages` overlay as the attribute `container` (2026-08-08)
+- [x] Add `container` to `flake-modules/packages.nix` so `nix build .#container` works standalone (2026-08-08)
+- [x] Add `container` to `home.packages` in `home/default.nix` (2026-08-08)
+- [x] Verify the derivation builds in isolation with `nix build .#container` (2026-08-08)
+- [x] Run the system rebuild and confirm `container --version` reports 1.2.2 from a Nix profile path (2026-08-08)
+- [x] Confirm `container run --rm ... echo` works with Colima stopped (2026-08-08)
+- [x] Confirm `container network list` works, so macOS 26 user-defined networks are available for plan 2 (2026-08-08)
+
+Milestone 2 — starting the background service automatically (code complete, activation pending):
+
+- [x] Determine how Apple Container registers its launch agent and whether `home-manager` can own it (2026-08-08)
+- [x] Write `home/apple-container.nix` with an activation hook, and import it from `home/default.nix` (2026-08-08)
+- [x] Verify the hook's three branches — not running, already running, stale store path — against the live service (2026-08-08)
+- [x] Verify the system builds with the module included (`./bin/build.sh`) (2026-08-08)
+- [ ] Activate it: `sudo ./bin/darwin-rebuild-sungkyung.sh` (blocked — `sudo` needs interactive auth, so the user must run it)
+- [ ] Confirm the service survives a reboot with no manual intervention (blocked on the reboot; `RunAtLoad = true` is present in the plist, so this is expected to pass)
+
+Reporting:
+
+- [x] Record findings, decisions, and the retrospective in this plan (2026-08-08)
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+**Apple Container's launch agent is invisible to `home-manager`, and not where the plan
+guessed.** It is not in `~/Library/LaunchAgents`. `container system start` writes its own
+plist to `~/Library/Application Support/com.apple.container/apiserver/apiserver.plist` and
+bootstraps it into the `user/<uid>` launchd domain — not the `gui/<uid>` domain every other
+service in the dotfiles repository uses. `launchctl print gui/501/com.apple.container.apiserver`
+therefore fails outright:
+
+```text
+$ launchctl print "gui/$(id -u)/com.apple.container.apiserver"
+Bad request.
+Could not find service "com.apple.container.apiserver" in domain for user gui: 501
+
+$ launchctl print "user/$(id -u)/com.apple.container.apiserver" | grep -E 'path|state|program'
+	path = /Users/shinzui/Library/Application Support/com.apple.container/apiserver/apiserver.plist
+	state = running
+	program = /nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2/bin/container-apiserver
+```
+
+Any future code that inspects this agent must use the `user/` domain. The `gui/` convention
+documented in `/Users/shinzui/Keikaku/dotfiles.nix/docs/local-services.md` does not apply.
+
+**The registration bakes in the Nix store path, which makes package upgrades a hazard.**
+This is the single most important finding of this plan and it is what shaped Milestone 2.
+The plist Apple writes contains:
+
+```text
+$ plutil -p "$HOME/Library/Application Support/com.apple.container/apiserver/apiserver.plist"
+{
+  "EnvironmentVariables" => {
+    "CONTAINER_APP_ROOT" => "/Users/shinzui/Library/Application Support/com.apple.container"
+    "CONTAINER_INSTALL_ROOT" => "/nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2"
+  }
+  "Label" => "com.apple.container.apiserver"
+  "ProgramArguments" => [
+    0 => "/nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2/bin/container-apiserver"
+    1 => "start"
+  ]
+  "RunAtLoad" => true
+}
+```
+
+`RunAtLoad => true` is good news: once registered, the service does come back at login on
+its own, so no `home-manager` launchd agent is needed and Approach A's premise holds. But
+the store path is frozen into the plist. Bump the derivation and the registration still
+points at the superseded path — first giving version skew (new CLI, old apiserver), then a
+silently dead agent once `nix-collect-garbage` removes that path. A naive "start it if it
+isn't running" hook would not notice either failure, because the *old* apiserver is running
+perfectly well. This is why the hook compares recorded against desired install root.
+
+**`container system start` does rewrite the plist**, which is what makes the fix work. Proven
+by doctoring the plist to a fake stale path and running the hook's logic:
+
+```text
+$ plutil -replace EnvironmentVariables.CONTAINER_INSTALL_ROOT \
+    -string "/nix/store/OLDPATHSIMULATED-container-1.1.0" "$apiserverPlist"
+$ ./test-activation.sh /nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2
+  [verbose] Apple Container apiserver is registered against /nix/store/OLDPATHSIMULATED-container-1.1.0,
+            expected /nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2; re-registering
+...
+--- BRANCH TAKEN: needsStart=1
+$ plutil -extract EnvironmentVariables.CONTAINER_INSTALL_ROOT raw -o - "$apiserverPlist"
+/nix/store/xapi2xhr8vb5g7npvn59nbrg1srwm680-container-1.2.2
+```
+
+**`container system status` is a well-behaved health check**: exit 0 when running and
+registered, exit 1 otherwise. The plan assumed this but did not state it; later plans can
+rely on it.
+
+```text
+$ container system status >/dev/null 2>&1; echo $?
+0
+$ container system stop && container system status >/dev/null 2>&1; echo $?
+1
+$ container system status
+apiserver is not running and not registered with launchd
+```
+
+**`container system stop` deregisters the agent but leaves the plist file on disk.** So the
+existence of `apiserver.plist` says nothing about whether the service is registered; only
+`container system status` does. The hook uses the plist purely to read the recorded store
+path, never as a liveness signal.
+
+**`--enable-kernel-install` is mandatory in any non-interactive context.** `container system
+start --help` states the flag pair's default outright:
+
+```text
+  --enable-kernel-install/--disable-kernel-install
+                          Specify whether the default kernel should be
+                          installed or not (default: prompt user)
+```
+
+An activation script or launchd agent that omits it would block forever on stdin. The first
+start did print `Installing kernel...` and wrote it under
+`~/Library/Application Support/com.apple.container/` — mutable state outside the Nix store,
+which is expected (it is `CONTAINER_APP_ROOT`, the equivalent of Docker's data root) but
+worth knowing: this directory is not reproducible from the flake, and plan 4's purge
+instructions should not assume otherwise.
+
+**`container network list` has no `STATE` column.** The plan's Validation section predicted
+`NETWORK  STATE  SUBNET`. Actual output on 1.2.2:
+
+```text
+$ container network list
+NETWORK  SUBNET
+default  192.168.64.0/24
+```
+
+The capability probe still passes — user-defined networks exist, so plan 2 can proceed — but
+plan 2 must not parse for a `STATE` column that is not there.
+
+**Nix flakes cannot see untracked files.** `nix build .#container` failed before the new
+derivation was `git add`ed, with an error that names the fix. Worth knowing because the
+failure is an evaluation error pointing at `overlays.nix`, not at the missing file:
+
+```text
+error: Path 'derivations/apple-container.nix' in the repository "/Users/shinzui/.config/dotfiles.nix"
+is not tracked by Git.
+```
+
+Note also that the dotfiles repository resolves through `/Users/shinzui/.config/dotfiles.nix`,
+which is the same tree as `/Users/shinzui/Keikaku/dotfiles.nix`.
+
+**nixpkgs still ships 1.1.0, confirming the premise.** Re-fetched during implementation:
+`https://raw.githubusercontent.com/NixOS/nixpkgs/nixpkgs-unstable/pkgs/by-name/co/container/package.nix`
+is byte-for-byte the structure quoted in Context and Orientation, still at `version = "1.1.0"`.
+`gh api repos/apple/container/releases/latest --jq .tag_name` returns `1.2.2`, so the
+prefetched hash in this plan was still correct and no re-prefetch was needed.
+
+**The first system rebuild carried an unrelated nixpkgs bump.** The dotfiles working tree had
+a large uncommitted `flake.lock` update predating this work, so the build moved the system
+from `darwin-system-26.05.56c666e` to `darwin-system-26.11.57a3171`. That was surfaced to the
+user, who chose to run the switch themselves and has since had the lock file committed
+separately (`chore(flake): refresh flake.lock`). Nothing about Apple Container depends on it,
+but it explains why the generation number jumps in this plan's transcripts.
 
 
 ## Decision Log
@@ -93,10 +240,109 @@ exists.
   require touching every consumer at that point.
   Date: 2026-08-08
 
+- Decision: Take Approach A (a `home.activation` hook), but extend it beyond what the plan
+  described — it must also detect Nix store path drift, not merely "start it if it is not
+  running".
+  Rationale: the plan offered Approach A and Approach B and asked for a deliberate choice.
+  Approach B (a `home-manager` launchd agent that starts the service at login) turned out to
+  be unnecessary: the plist Apple writes already sets `RunAtLoad = true`, so a second agent
+  would duplicate a job launchd is already doing, and would do it in the `gui/` domain while
+  Apple's own agent lives in `user/`. But Approach A as originally described was also
+  insufficient, because the registration freezes the Nix store path (see Surprises &
+  Discoveries). After a version bump the old apiserver keeps running happily from a
+  superseded store path, so a liveness-only check never fires. The hook therefore compares
+  the `CONTAINER_INSTALL_ROOT` recorded in the plist against the store path the current
+  generation installs, and stops and restarts the service when they differ.
+  Date: 2026-08-08
+
+- Decision: Pass `--enable-kernel-install` explicitly rather than relying on the default.
+  Rationale: `container system start --help` documents the flag pair's default as
+  "prompt user". An activation script has no usable stdin, so omitting the flag risks
+  blocking `darwin-rebuild switch` indefinitely on a machine that has not yet installed the
+  default Linux kernel. Choosing `--enable-kernel-install` over `--disable-kernel-install`
+  is deliberate: without a kernel, `container run` cannot start a Linux VM at all, which is
+  the entire point of the MasterPlan.
+  Date: 2026-08-08
+
+- Decision: Make the activation hook incapable of failing the switch.
+  Rationale: every `container` invocation in the hook is guarded, and a failed start only
+  emits a warning. The service being down is a recoverable inconvenience — one manual
+  `container system start` fixes it — whereas a failed `darwin-rebuild switch` blocks every
+  unrelated change to the machine. This mirrors the plan's own Idempotence and Recovery
+  guidance not to block the MasterPlan on the autostart mechanism.
+  Date: 2026-08-08
+
+- Decision: Leave `container` in `home/default.nix`'s `home.packages` rather than moving it
+  into `home/apple-container.nix`.
+  Rationale: the plan specified that placement, next to `docker` and `colima`, and keeping
+  the three container runtimes visible in one list is more discoverable than hiding one of
+  them in a module. The module owns only the service lifecycle.
+  Date: 2026-08-08
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+**What was achieved.** Apple Container 1.2.2 is installed by Nix and running on this machine.
+`which container` resolves to `/Users/shinzui/.nix-profile/bin/container`, not `/usr/local/bin`,
+so nothing was installed outside Nix's control. A Linux container runs with Colima stopped,
+which was the plan's headline acceptance criterion:
+
+```text
+$ colima status
+level=fatal msg="colima is not running"
+$ container run --rm docker.io/library/alpine:latest sh -c 'echo ok; uname -s'
+ok
+Linux
+```
+
+`uname -s` printing `Linux` from a command issued on macOS is the proof that a real Linux VM
+booted. `container network list` succeeds, so the macOS 26 user-defined-network capability the
+rest of the MasterPlan depends on is confirmed present, and plan 2 is unblocked.
+
+Four commits landed in `/Users/shinzui/Keikaku/dotfiles.nix`: the pinned derivation plus its
+overlay, packages-output, and `home.packages` registration; and the service module. A fifth,
+`chore(flake): refresh flake.lock`, committed a pre-existing unrelated working-tree change at
+the user's request and deliberately carries no plan trailers.
+
+**What remains.** Two items, both blocked on things this session could not do rather than on
+unresolved design questions:
+
+The activation hook in `home/apple-container.nix` is written, imported, and *built* — the full
+system builds cleanly with it — but not yet activated, because `sudo` on this machine requires
+interactive authentication and `darwin-rebuild switch` cannot be driven non-interactively. The
+user needs to run `sudo ./bin/darwin-rebuild-sungkyung.sh` from
+`/Users/shinzui/Keikaku/dotfiles.nix`. This is low-risk: the hook's logic was validated
+separately against the live service (all three branches), so activation should be a no-op that
+reports the service already running against the expected store path.
+
+The reboot test is likewise outstanding. `RunAtLoad = true` is present in Apple's own plist and
+the agent is registered in the `user/<uid>` domain, which persists across logins, so this is
+expected to pass — but the plan asked for it to be verified rather than assumed, and it has not
+been. If it turns out to fail, the recorded fallback stands: accept a manual
+`container system start`, and have plans 3 and 4 make the Redpanda launchd agent wait for the
+API server rather than assume it.
+
+**Lessons worth carrying forward.** The plan's instinct to separate "make the binary exist"
+from "make the service run" paid off, but for a reason it did not anticipate. Milestone 2 was
+not hard because starting a service is hard — Apple already sets `RunAtLoad`, so login startup
+needed no work at all. It was hard because the registration is *stale-able*: it captures a Nix
+store path at registration time, which is exactly the kind of impedance mismatch between an
+immutable store and a self-registering third-party daemon that only shows up when you look at
+the artifact the daemon writes. Reading the generated plist, rather than trusting that
+`container system start` is idempotent, is what surfaced it.
+
+Validating the activation logic by extracting it into a standalone script with stubbed
+`run`/`verboseEcho`/`warnEcho` helpers turned out to be worth the small effort. It made all
+three branches testable in seconds against the real service without a `darwin-rebuild switch`
+per attempt, and it is how the drift branch was proven rather than merely reasoned about.
+
+**Bearing on later plans.** Plan 2 can rely on: `container system status` exiting 0/1 as a
+health check, the `user/<uid>` launchd domain for any agent inspection, `container network list`
+having no `STATE` column, and `CONTAINER_APP_ROOT` at
+`~/Library/Application Support/com.apple.container` being mutable state outside Nix that a purge
+path must account for. Plan 3's launchd agent should not assume the API server is already up
+when it starts; the sleep/wake unreliability noted in the MasterPlan plus the drift behaviour
+here both argue for polling readiness rather than assuming it.
 
 
 ## Context and Orientation
