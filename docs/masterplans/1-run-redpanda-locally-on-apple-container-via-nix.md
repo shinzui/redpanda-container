@@ -151,9 +151,17 @@ mori registry concepts --search 'container runtime' --json
 # []
 ```
 
-**No relevant ADR exists.** Two durable decisions from this initiative are strong ADR
-candidates and should be promoted to `docs/adr/` in this repository as the work proceeds
-— see Integration Points for which plan owns each:
+**Update, 2026-08-09:** EP-3 created `docs/adr/` and wrote the first two records, so the two
+candidates below are no longer pending — they are
+[`docs/adr/1-no-compiled-cli-for-local-redpanda.md`](../adr/1-no-compiled-cli-for-local-redpanda.md)
+and
+[`docs/adr/2-redpanda-container-naming-and-port-contract.md`](../adr/2-redpanda-container-naming-and-port-contract.md).
+Two further candidates surfaced during implementation and remain open for the completion
+distillation pass: the Nix store-path drift constraint EP-1 discovered, and the topic
+namespacing convention plus destructive-command prohibition that EP-5 owns.
+
+**No relevant ADR existed at planning time.** Two durable decisions from this initiative were
+identified as strong ADR candidates — see Integration Points for which plan owns each:
 
 1. *Why there is no compiled CLI, and what would justify building one.* This is the
    decision most likely to be re-litigated by a future reader holding
@@ -176,7 +184,7 @@ the `just status-*` / `restart-*` / `logs-*` recipe families, and the Caddy
 |---|-------|------|-----------|-----------|--------|
 | 1 | Package Apple Container at its latest release in Nix | docs/plans/1-package-apple-container-at-its-latest-release-in-nix.md | None | None | In Progress |
 | 2 | Spike: prove Redpanda runs on Apple Container | docs/plans/2-spike-prove-redpanda-runs-on-apple-container.md | EP-1 | None | Complete |
-| 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Not Started |
+| 3 | Build the redpanda-container flake and home-manager module | docs/plans/3-build-the-redpanda-container-flake-and-home-manager-module.md | EP-2 | EP-1 | Complete |
 | 4 | Adopt the Nix-managed Redpanda across projects and retire the colima path | docs/plans/4-adopt-the-nix-managed-redpanda-across-projects-and-retire-the-colima-path.md | EP-3 | EP-1 | Not Started |
 | 5 | Document how projects use the shared Redpanda for testing | docs/plans/5-document-how-projects-use-the-shared-redpanda-for-testing.md | EP-4 | EP-2 | Not Started |
 
@@ -349,10 +357,11 @@ candidate**, alongside the store-path drift constraint EP-1 discovered.
 - [x] EP-2: Redpanda starts in `dev-container` mode and Kafka is reachable from the macOS host (2026-08-08)
 - [x] EP-2: container-to-container networking and name resolution verified; internal addressing decided (2026-08-08) — no name resolution exists; bind-mounted `/etc/hosts` chosen
 - [x] EP-2: volume persistence across container deletion verified; findings written up (2026-08-08)
-- [ ] EP-3: flake skeleton exports `homeManagerModules.redpanda-container`
-- [ ] EP-3: module renders `redpanda-up` / `redpanda-down` / `redpanda-status` / `redpanda-logs` / `redpanda-purge`
-- [ ] EP-3: launchd agent starts the cluster at login and readiness polling works
-- [ ] EP-3: module exercised end to end from a standalone `nix build` / `home-manager` test
+- [x] EP-3: flake exports `homeManagerModules.default` and `homeManagerModules.redpanda-container` (2026-08-09)
+- [x] EP-3: module renders `redpanda-up` / `redpanda-down` / `redpanda-status` / `redpanda-logs` / `redpanda-purge` (2026-08-09)
+- [x] EP-3: launchd agent declared with `RunAtLoad` and `KeepAlive = { SuccessfulExit = false; }`; readiness polling works (2026-08-09) — the agent itself is exercised at login by EP-4
+- [x] EP-3: module exercised end to end from a standalone `nix build` and a scratch `home-manager` configuration (2026-08-09)
+- [x] EP-3: `docs/adr/` created with the initiative's first two records (2026-08-09)
 - [ ] EP-4: dotfiles consumes the flake input and imports the module; `darwin-rebuild switch` succeeds
 - [ ] EP-4: `rpk` profile generated; produce/consume works from at least two unrelated project directories
 - [ ] EP-4: Console reachable and showing topics; runbook and rollback documented

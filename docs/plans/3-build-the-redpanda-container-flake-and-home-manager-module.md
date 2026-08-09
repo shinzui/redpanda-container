@@ -70,23 +70,91 @@ This is child plan 3 of the MasterPlan at
 
 ## Progress
 
-- [ ] Read `docs/spikes/1-apple-container-redpanda-findings.md` and transcribe its verified commands
-- [ ] Create `flake.nix` with `nixpkgs` and `flake-parts` inputs and an `aarch64-darwin` system
-- [ ] Define the module skeleton at `modules/home/redpanda-container.nix` with its options
-- [ ] Implement the `redpanda-up` wrapper, including readiness polling
-- [ ] Implement `redpanda-down`, `redpanda-status`, `redpanda-logs`, `redpanda-purge`
-- [ ] Implement the launchd agent and its pre-activation stop-and-wait hook
-- [ ] Export `homeManagerModules.default` and a `packages.<system>.redpanda-scripts` for testing
-- [ ] Build the scripts standalone with `nix build` and run each one by hand
-- [ ] Verify produce/consume, Console, persistence, and purge against the module's own output
-- [ ] Write the README explaining what the flake provides and how to consume it
-- [ ] Create `docs/adr/` and record the two ADRs this initiative owns
-- [ ] Record findings, decisions, and the retrospective in this plan
+- [x] Read `docs/spikes/1-apple-container-redpanda-findings.md` and transcribe its verified commands (2026-08-09)
+- [x] Create `flake.nix` with `nixpkgs` and `home-manager` inputs and an `aarch64-darwin` system (2026-08-09) — plain flake, not `flake-parts`; see Decision Log
+- [x] Define the module at `modules/home/redpanda-container.nix` with its options (2026-08-09)
+- [x] Split the option defaults into `modules/home/defaults.nix` so the scripts build standalone (2026-08-09)
+- [x] Implement the `redpanda-up` wrapper, including readiness polling and hosts-file generation (2026-08-09)
+- [x] Implement `redpanda-down`, `redpanda-status`, `redpanda-logs`, `redpanda-purge` (2026-08-09)
+- [x] Implement the launchd agent and its pre-activation stop-and-wait hook (2026-08-09)
+- [x] Export `homeManagerModules.default` and `packages.aarch64-darwin.redpanda-scripts` (2026-08-09)
+- [x] Build the scripts standalone with `nix build` and run each one by hand (2026-08-09)
+- [x] Verify produce/consume, Console, persistence, idempotence, and purge against the module's own output (2026-08-09)
+- [x] Verify the failure path: with the runtime stopped, `redpanda-up` exits 1 with actionable output (2026-08-09)
+- [x] Verify the Console-restart-on-broker-IP-change behaviour the spike required (2026-08-09)
+- [x] Build `homeConfigurations.test.activationPackage` and inspect the generated plist (2026-08-09)
+- [x] Write the README explaining what the flake provides and how to consume it (2026-08-09)
+- [x] Create `docs/adr/` and record the two ADRs this initiative owns (2026-08-09)
+- [x] Record findings, decisions, and the retrospective in this plan (2026-08-09)
 
 
 ## Surprises & Discoveries
 
-(None yet.)
+**Volumes and networks put the resource name at top-level `.id`, not `.name` — and the
+idempotence test is what caught it.** The first `redpanda-up` succeeded completely, which
+made the code look correct. The second run printed `Creating volume redpanda-0-data...`
+followed by `Error: volume 'redpanda-0-data' already exists` and aborted, because the
+existence check matched on a field that does not exist:
+
+```text
+$ container volume list --format json | jq '.[0]'
+{
+  "configuration": { "name": "redpanda-0-data", ... },
+  "id": "redpanda-0-data"
+}
+```
+
+There is no top-level `.name`, so `select(.name == $v)` never matched and the script tried
+to create an existing volume every time. All three resource kinds — containers, volumes,
+networks — carry the name at top-level `.id`, so every existence check now matches on that
+uniformly. Worth noting that containers *also* expose it at `.configuration.id`, which is
+what the spike recorded; using `.id` everywhere is the consistent choice.
+
+This is a good argument for the plan's insistence on testing idempotence explicitly rather
+than assuming it. A first run proves nothing about the second.
+
+**`shellcheck` rejected the shared prelude, which improved the design.**
+`writeShellApplication` runs `shellcheck` at build time and a warning fails the build. A
+single prelude interpolated into all five scripts meant `redpanda-logs` inherited variables
+it never used:
+
+```text
+In redpanda-logs line 9:
+hosts_file="$state_dir/console-hosts"
+^--------^ SC2034 (warning): hosts_file appears unused.
+```
+
+The plan said to fix the shell rather than disable the check, which turned out to be the
+right call: the fix was to break the prelude into named fragments and have each script
+declare which it needs. That is strictly better than one shared blob — it makes each
+script's actual dependencies visible in one list at its definition.
+
+**`home-manager` wraps launchd `ProgramArguments` with `wait4path`.** The generated plist is
+not a bare invocation of the script:
+
+```text
+"ProgramArguments" => [
+  0 => "/bin/sh"
+  1 => "-c"
+  2 => "/bin/wait4path /nix/store && exec /nix/store/...-redpanda-up/bin/redpanda-up"
+]
+```
+
+This handles the Nix store not being mounted yet at login, which is a race this module would
+otherwise have had to think about. Nothing to do; worth knowing it is there.
+
+**`nix build` clobbers `./result` between different outputs.** Building
+`.#homeConfigurations.test.activationPackage` replaced the `result` symlink that had been
+pointing at the scripts, so `./result/bin/redpanda-up` silently became "no such file or
+directory". Not a bug, just a trap when a plan's steps build two different things and then
+run the first. Use `-o result-scripts` for the scripts; `.gitignore` already covers
+`result-*`.
+
+**The exit-status-through-a-pipeline trap recurred.** `./result/bin/redpanda-up | grep ...;
+echo $?` reports `grep`'s status, not the script's, which briefly made a failing
+`redpanda-up` look like it exited 0. The same trap appeared in plan 2 with `container image
+pull | tail`. When verifying a command's exit code, redirect to a file and check `$?`
+directly rather than piping.
 
 
 ## Decision Log
@@ -117,10 +185,151 @@ This is child plan 3 of the MasterPlan at
   Revisit if `shellcheck` proves obstructive.
   Date: 2026-08-08
 
+- Decision: A plain flake, not `flake-parts`.
+  Rationale: the plan left this open. `flake-parts` earns its keep when a flake has many
+  systems or many per-system outputs to keep in step; this one has a single system
+  (`aarch64-darwin`, because Apple Container exists nowhere else) and three outputs. There is
+  nothing for its per-system plumbing to simplify, and it would add an input to lock and
+  update. The consumer using `flake-parts` does not oblige this flake to.
+  Date: 2026-08-09
+
+- Decision: `KeepAlive = { SuccessfulExit = false; }` for the launchd agent, not `true` and
+  not omitted.
+  Rationale: the plan flagged this as needing a deliberate choice. The agent is a one-shot —
+  it runs `redpanda-up` and exits; the long-running processes are the containers, which Apple
+  Container's own service supervises. `KeepAlive = true` would restart a successfully exiting
+  script in a tight loop. Omitting `KeepAlive` entirely would mean a bring-up that failed at
+  login (because the API server was not up yet, say) is never retried. `SuccessfulExit = false`
+  gives exactly the useful half: retry on failure, leave it alone on success.
+  Date: 2026-08-09
+
+- Decision: Split option defaults into `modules/home/defaults.nix`, separate from the module.
+  Rationale: `packages.aarch64-darwin.redpanda-scripts` must build without `home-manager`
+  supplying an option set, which the plan requires so milestone 3 is independently verifiable.
+  A separate defaults file lets both the module and the standalone package read the same
+  values, so they cannot drift. The alternative — duplicating defaults in the flake — would
+  have created exactly the drift the option system exists to prevent.
+  Date: 2026-08-09
+
+- Decision: Console's configuration is a Nix store file; only the hosts file is generated at
+  runtime.
+  Rationale: the spike wrote Console's config through an entrypoint override, because that is
+  what `rpk container start` and the Redpanda quickstart do. But the config is entirely static
+  — it names the broker by `internalHost` and by container-side ports, none of which vary at
+  runtime — so it can be a `writeText` store file bind-mounted in. Only the broker's IP is
+  dynamic. This avoids overriding the image's entrypoint at all, which is simpler and keeps
+  Console running as its own non-root user.
+  Date: 2026-08-09
+
+- Decision: Drive every value the scripts use from options, including the names, ports,
+  labels, and the `redpanda-purge` filter — while still shipping only the single shared
+  cluster.
+  Rationale: the user asked during implementation whether per-project clusters should be
+  supported for destructive tests, as distinct from the shared development cluster. The
+  MasterPlan excludes per-project clusters and, more sharply, names them as one of three
+  stated reversal criteria for the no-compiled-CLI decision, so adopting them is not a small
+  additive change. The chosen middle path is to make a second instance a matter of passing
+  different values rather than rewriting the scripts, and to let plan 5's consumer inventory
+  determine whether any test suite genuinely needs a destructive cluster. Nothing about the
+  shipped behaviour changes; the internals simply have no hard-coded constants.
+  Date: 2026-08-09
+
+- Decision: Match every existence check on top-level `.id`.
+  Rationale: containers, volumes, and networks all carry the resource name there, whereas
+  `.name` exists on none of them at top level and `.configuration.id` exists only on
+  containers. Using one path for all three removes a class of bug that had already produced
+  one (see Surprises & Discoveries).
+  Date: 2026-08-09
+
 
 ## Outcomes & Retrospective
 
-(To be filled during and after implementation.)
+**What was achieved.** This repository is now a flake exporting
+`homeManagerModules.default`, five wrapper commands, and a launchd agent. Every acceptance
+criterion in Validation and Acceptance was demonstrated against the module's own build
+output rather than hand-typed commands.
+
+From a genuinely clean machine state — no containers, no volume, no network — one command
+brings up a working cluster:
+
+```text
+$ ./result-scripts/bin/redpanda-up
+Creating volume redpanda-0-data...
+Creating network redpanda...
+Starting broker redpanda-0...
+Starting console redpanda-console...
+
+Redpanda is ready.
+```
+
+Kafka works from macOS, and Console reaches the broker over the container network at the
+same time — which is the proof that the internal/external listener split and the generated
+hosts file are both correct:
+
+```text
+$ rpk topic consume module-test -n 1 --brokers 127.0.0.1:9092
+{"value":"from the module","offset":0}
+$ curl -s http://127.0.0.1:8080/api/topics | jq -r '.topics[].topicName'
+_schemas
+module-test
+```
+
+The remaining behaviours were each verified explicitly: `redpanda-up` is idempotent (second
+run reports "already running", exits 0, creates nothing); data survives `redpanda-down`
+followed by `redpanda-up`; `redpanda-status` exits 0 when serving and 1 when not;
+`redpanda-logs` works for both containers; `redpanda-purge` prompts, refuses on anything but
+`yes`, is idempotent under `--force`, and leaves nothing behind; and with the runtime stopped
+`redpanda-up` exits 1 with actionable output rather than a bare failure.
+
+The one behaviour worth calling out separately is the spike's H2 finding, which this module
+had to handle rather than merely document. Restarting the broker alone — leaving Console
+running — changes the broker's IP and strands Console on a stale hosts entry. The module
+detects it and self-heals:
+
+```text
+$ container stop redpanda-0 && container start redpanda-0    # new IP: 192.168.65.6
+$ ./result-scripts/bin/redpanda-up
+Broker redpanda-0 already running.
+Broker address changed; restarting console redpanda-console...
+Redpanda is ready.
+$ curl -s http://127.0.0.1:8080/api/topics | jq -r '.topics[].topicName'
+_schemas
+module-test
+```
+
+**What changed relative to the plan.** Three things. The plan left the `flake-parts` question
+open and it was resolved as a plain flake. It left `KeepAlive` open and it was resolved as
+`{ SuccessfulExit = false; }`. And it assumed a single shared prelude across the five
+scripts, which `shellcheck` rejected — the fix, per-script prelude fragments, is better than
+what was planned.
+
+A fourth change came from outside the plan: the user asked mid-implementation whether
+per-project clusters should be supported for destructive tests. That is deliberately not
+built, but every constant the scripts might need to vary is now an option, so it becomes
+configuration rather than redesign if plan 5's inventory shows a real need.
+
+**Lessons worth carrying forward.** Testing idempotence is not optional and not
+theoretical. The first `redpanda-up` succeeded completely and proved nothing; the bug —
+matching volumes on a `.name` field that does not exist — only appeared on the second run.
+Any script whose whole contract is "safe to run repeatedly" needs its second run tested as a
+first-class acceptance criterion, not as a formality.
+
+Letting the linter win produced a better design. The obvious reaction to
+`SC2034: hosts_file appears unused` is to suppress it; taking it seriously forced each
+script to declare its own dependencies, which is now the clearest documentation of what each
+one actually touches.
+
+Finally, the spike paid off exactly as intended. Four things that would have been baffling
+inside a launchd agent — the volume ownership, the wrong default architecture, the absence of
+name resolution, and Console stranding on IP change — were already known, so this plan spent
+its debugging budget on its own bugs rather than on the runtime's behaviour.
+
+**Bearing on plan 4.** The option schema `services.redpanda-container.*` is now fixed and is
+MasterPlan Integration Point 5; plan 4 sets these options and must not rename them without
+changing this module in the same commit. The launchd label is `com.shinzui.redpanda` and
+logs land in `~/.local/state/redpanda/logs/`, which plan 4 may want in `just` recipes,
+`docs/local-services.md`, and possibly a VictoriaLogs shipper entry. Plan 4 must also **not**
+add a `sudo container system dns create` step, per the spike.
 
 
 ## Context and Orientation
