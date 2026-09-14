@@ -116,19 +116,19 @@ let
 in
 {
   redpanda-up = mkScript "redpanda-up"
-    [
+    ([
       "state_dir"
-      "hosts_file"
       "broker"
-      "console"
       "network"
       "volume"
       "ready_url"
       "fn_container_state"
-      "fn_broker_ip"
       "fn_broker_ready"
       "fn_wait_for_runtime"
-    ] ''
+    ]
+    # Console-only helpers. Including them when the console is disabled leaves
+    # them unused, which fails the writeShellApplication shellcheck.
+    ++ lib.optionals cfg.enableConsole [ "hosts_file" "console" "fn_broker_ip" ]) ''
     wait_for_runtime
 
     mkdir -p "$state_dir"
@@ -160,7 +160,7 @@ in
     # --- broker -------------------------------------------------------------
     # Three-way branch: `container run --name X` fails if any container called X
     # exists, even a stopped one, so "absent" and "stopped" need different verbs.
-    broker_was_started=0
+    ${lib.optionalString cfg.enableConsole "broker_was_started=0"}
     case "$(container_state "$broker")" in
       running)
         printf 'Broker %s already running.\n' "$broker"
@@ -168,7 +168,7 @@ in
       stopped)
         printf 'Starting existing broker %s...\n' "$broker"
         ${container} start "$broker" >/dev/null
-        broker_was_started=1
+        ${lib.optionalString cfg.enableConsole "broker_was_started=1"}
         ;;
       *)
         printf 'Starting broker %s...\n' "$broker"
@@ -198,7 +198,7 @@ in
             --mode dev-container \
             --smp 1 \
             --default-log-level=info >/dev/null
-        broker_was_started=1
+        ${lib.optionalString cfg.enableConsole "broker_was_started=1"}
         ;;
     esac
 
@@ -318,7 +318,9 @@ in
   # Exits non-zero when the broker is not running and serving, so it is usable as
   # a gate in scripts and just recipes.
   redpanda-status = mkScript "redpanda-status"
-    [ "broker" "console" "ready_url" "fn_container_state" "fn_broker_ready" ] ''
+    ([ "broker" "ready_url" "fn_container_state" "fn_broker_ready" ]
+    # The console name is only referenced in the console-enabled block below.
+    ++ lib.optionals cfg.enableConsole [ "console" ]) ''
     if ! ${container} system status >/dev/null 2>&1; then
       printf 'The Apple Container service is not running.\n\n' >&2
       printf 'Start it with:\n\n    container system start\n' >&2
