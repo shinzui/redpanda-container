@@ -94,7 +94,7 @@ nothing is hard-coded in the shell.
 | Option | Default | Purpose |
 |---|---|---|
 | `enable` | `false` | Turn the module on |
-| `package` | `pkgs.container` | The Apple Container package |
+| `package` | `pkgs.container` | The Apple Container package; `null` uses `container` from PATH. Must match the running server's release |
 | `redpandaImage` | `docker.io/redpandadata/redpanda:v26.2.1` | Broker image |
 | `consoleImage` | `docker.io/redpandadata/console:v3.9.0` | Console image |
 | `platform` | `linux/arm64` | Passed to `container run` |
@@ -112,6 +112,7 @@ nothing is hard-coded in the shell.
 | `autoStart` | `true` | Install the launchd agent |
 | `readyTimeoutSeconds` | `120` | How long to wait for the broker |
 | `runtimeTimeoutSeconds` | `60` | How long to wait for Apple Container itself |
+| `lifecycleTimeoutSeconds` | `90` | Ceiling on `container start` / `network create` |
 
 ## Two things that look strange and are not
 
@@ -147,6 +148,23 @@ redpanda-up
 
 If `redpanda-up` reports the Apple Container service is not responding, start it with
 `container system start`.
+
+If it reports that the `container` CLI does not match the running service, the scripts were
+built against a different Apple Container release than the one installed. This
+happens when a project flake imports `scripts.nix` with its own nixpkgs: plain
+nixpkgs ships an older `container` than the dotfiles overlay. Set `package` to the build
+the server runs, or to `null` to use the host's `container` from PATH. A mismatched CLI is
+refused rather than tolerated because it can hang indefinitely instead of failing.
+
+If `redpanda-up` says a `container start` or `container network create` did not finish in
+time, Apple Container's network service has wedged. Running containers keep working, but
+nothing can join a network. `launchctl list | grep container-network-vmnet` shows each
+network's helper; a `-` PID with status `-15` means it was terminated. Only a runtime restart
+recovers from this, and it stops every container on the machine:
+
+```bash
+container system stop && container system start
+```
 
 To reset completely, `redpanda-purge --force` followed by `redpanda-up` gives a clean
 cluster. This destroys all data.

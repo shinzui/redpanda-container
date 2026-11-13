@@ -14,7 +14,14 @@ let
   inherit (cfg) internalHost hostAddress labelPrefix;
   cp = cfg.containerPorts;
 
-  container = "${cfg.package}/bin/container";
+  # package = null means "the host's `container` on PATH", for project flakes whose
+  # own nixpkgs would otherwise pin a CLI that does not match the running server.
+  # See the `package` comment in defaults.nix.
+  container =
+    if cfg.package == null then "container" else "${cfg.package}/bin/container";
+
+  # Tolerates cfg sets built before this knob existed.
+  lifecycleTimeoutSeconds = cfg.lifecycleTimeoutSeconds or 90;
 
   # Console's configuration is entirely static -- it names the broker by the
   # internal host string and by container-side ports, none of which vary at
@@ -32,7 +39,9 @@ let
         urls: ["http://${internalHost}:${toString cp.admin}"]
   '';
 
-  runtimeInputs = [ cfg.package pkgs.jq pkgs.curl pkgs.coreutils ];
+  runtimeInputs =
+    lib.optional (cfg.package != null) cfg.package
+    ++ [ pkgs.jq pkgs.curl pkgs.coreutils ];
 
   # Prelude fragments, composed per script rather than shipped as one shared blob.
   # writeShellApplication runs shellcheck, which flags an unused variable as a
@@ -84,14 +93,94 @@ let
       }
     '';
 
+    # Fails unless the `container` CLI these scripts call is the same release as
+    # the running container-apiserver. A mismatched client does not error out: a
+    # 1.1.0 client's `container start` against a 1.5.0 server hung for 15 minutes
+    # before it was killed. Comparing up front turns that into an immediate,
+    # explained failure.
+    #
+    # `system status --format json` differs by release: 1.5.0 reports
+    # .client.version and .server.version, 1.1.0 reports only .apiServerVersion.
+    # The client's own version therefore falls back to `container --version`,
+    # which every release prints as "container CLI version X (...)". If either
+    # side cannot be determined the check passes, so an output-format change in a
+    # future release degrades to no check rather than to a false failure.
+    #
+    # Expects the server to be up; call it after `system status` succeeds.
+    fn_check_container_versions = ''
+      check_container_versions() {
+        local status="" client="" server="" install_root="" version_line=""
+        status=$(${container} system status --format json 2>/dev/null) || return 0
+        server=$(printf '%s' "$status" \
+          | jq -r '.server.version // .apiServerVersion // empty' 2>/dev/null) || server=""
+        install_root=$(printf '%s' "$status" \
+          | jq -r '.paths.installRoot // .installRoot // empty' 2>/dev/null) || install_root=""
+        client=$(printf '%s' "$status" | jq -r '.client.version // empty' 2>/dev/null) || client=""
+        if [ -z "$client" ]; then
+          version_line=$(${container} --version 2>/dev/null) || version_line=""
+          if [[ "$version_line" =~ version\ ([0-9][^[:space:]]*) ]]; then
+            client="''${BASH_REMATCH[1]}"
+          fi
+        fi
+        if [ -z "$client" ] || [ -z "$server" ] || [ "$client" = "$server" ]; then
+          return 0
+        fi
+        if [ "''${REDPANDA_ALLOW_CONTAINER_VERSION_SKEW:-0}" = 1 ]; then
+          printf 'Warning: container CLI %s does not match container-apiserver %s; continuing because REDPANDA_ALLOW_CONTAINER_VERSION_SKEW=1.\n' \
+            "$client" "$server" >&2
+          return 0
+        fi
+        printf '\n' >&2
+        printf 'The container CLI these scripts use does not match the running Apple Container service.\n\n' >&2
+        printf '    CLI      %s  (%s)\n' "$client" "$(command -v ${container} || printf '%s' '${container}')" >&2
+        printf '    server   %s  (%s)\n\n' "$server" "''${install_root:-unknown install root}" >&2
+        printf 'A mismatched client can hang indefinitely rather than fail, so nothing was done.\n\n' >&2
+        printf 'Fix the package these scripts are built with: pass the build the server runs\n' >&2
+        printf '(the dotfiles overlay'"'"'s container), or set package = null to use the\n' >&2
+        printf 'container command on PATH. To bypass this check at your own risk, set\n' >&2
+        printf 'REDPANDA_ALLOW_CONTAINER_VERSION_SKEW=1.\n' >&2
+        return 1
+      }
+    '';
+
+    # Runs a container-lifecycle call that should take seconds, under a ceiling.
+    # When Apple Container's network service wedges, `container start` and
+    # `container network create` block forever with no output; this reports that
+    # instead of hanging. Usage: bounded "<what it was doing>" container args...
+    fn_bounded = ''
+      bounded() {
+        local what="$1" rc=0
+        shift
+        # -k: some container subcommands ignore SIGTERM while blocked on XPC.
+        timeout -k 10 ${toString lifecycleTimeoutSeconds} "$@" || rc=$?
+        if [ "$rc" -eq 124 ]; then
+          printf '\n%s did not finish within %ss.\n\n' "$what" '${toString lifecycleTimeoutSeconds}' >&2
+          printf 'Apple Container'"'"'s network service is probably wedged. Its per-network\n' >&2
+          printf 'helpers are launchd jobs; a dead one shows a "-" PID here:\n\n' >&2
+          printf '    launchctl list | grep container-network-vmnet\n\n' >&2
+          printf 'If they are dead, or container network create also hangs, restart the\n' >&2
+          printf 'runtime. This stops every running container on the machine:\n\n' >&2
+          printf '    container system stop && container system start\n' >&2
+        fi
+        return "$rc"
+      }
+    '';
+
     # Apple Container's API server may not be up yet when this runs at login, so
     # this waits rather than failing. `container system status` exits 0 when the
-    # server is running and registered, 1 otherwise.
+    # server is running and registered, 1 otherwise. Once it is up, the CLI's
+    # version is checked against the server's.
     fn_wait_for_runtime = ''
       wait_for_runtime() {
         local deadline=$((SECONDS + ${toString cfg.runtimeTimeoutSeconds}))
+        if ! command -v ${container} >/dev/null 2>&1; then
+          printf 'No container command on PATH. Install Apple Container, or build these\n' >&2
+          printf 'scripts with an explicit container package.\n' >&2
+          return 1
+        fi
         if ${container} system status >/dev/null 2>&1; then
-          return 0
+          check_container_versions
+          return
         fi
         printf 'Waiting for the Apple Container service...\n'
         while ! ${container} system status >/dev/null 2>&1; do
@@ -105,6 +194,7 @@ let
           fi
           sleep 1
         done
+        check_container_versions
       }
     '';
   };
@@ -124,7 +214,9 @@ in
       "ready_url"
       "fn_container_state"
       "fn_broker_ready"
+      "fn_check_container_versions"
       "fn_wait_for_runtime"
+      "fn_bounded"
     ]
     # Console-only helpers. Including them when the console is disabled leaves
     # them unused, which fails the writeShellApplication shellcheck.
@@ -154,7 +246,7 @@ in
     if ! ${container} network list --format json 2>/dev/null \
         | jq -e --arg n "$network" '(. // [])[] | select(.id == $n)' >/dev/null 2>&1; then
       printf 'Creating network %s...\n' "$network"
-      ${container} network create "$network" >/dev/null
+      bounded "Creating network $network" ${container} network create "$network" >/dev/null
     fi
 
     # --- broker -------------------------------------------------------------
@@ -167,7 +259,7 @@ in
         ;;
       stopped)
         printf 'Starting existing broker %s...\n' "$broker"
-        ${container} start "$broker" >/dev/null
+        bounded "Starting broker $broker" ${container} start "$broker" >/dev/null
         ${lib.optionalString cfg.enableConsole "broker_was_started=1"}
         ;;
       *)
@@ -254,7 +346,7 @@ in
       if [ "$console_state" = running ] && { [ "$hosts_changed" = 1 ] || [ "$broker_was_started" = 1 ]; }; then
         printf 'Broker address changed; restarting console %s...\n' "$console"
         ${container} stop "$console" >/dev/null 2>&1 || true
-        ${container} start "$console" >/dev/null
+        bounded "Restarting console $console" ${container} start "$console" >/dev/null
       else
         case "$console_state" in
           running)
@@ -262,7 +354,7 @@ in
             ;;
           stopped)
             printf 'Starting existing console %s...\n' "$console"
-            ${container} start "$console" >/dev/null
+            bounded "Starting console $console" ${container} start "$console" >/dev/null
             ;;
           *)
             printf 'Starting console %s...\n' "$console"
@@ -318,7 +410,7 @@ in
   # Exits non-zero when the broker is not running and serving, so it is usable as
   # a gate in scripts and just recipes.
   redpanda-status = mkScript "redpanda-status"
-    ([ "broker" "ready_url" "fn_container_state" "fn_broker_ready" ]
+    ([ "broker" "ready_url" "fn_container_state" "fn_broker_ready" "fn_check_container_versions" ]
     # The console name is only referenced in the console-enabled block below.
     ++ lib.optionals cfg.enableConsole [ "console" ]) ''
     if ! ${container} system status >/dev/null 2>&1; then
@@ -326,6 +418,7 @@ in
       printf 'Start it with:\n\n    container system start\n' >&2
       exit 1
     fi
+    check_container_versions
 
     printf '%-20s %-8s %-9s %s\n' NAME ROLE STATE ADDRESS
 

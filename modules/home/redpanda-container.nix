@@ -17,7 +17,7 @@ let
       package redpandaImage consoleImage platform enableConsole
       network brokerName consoleName volumeName nodeId labelPrefix
       internalHost hostAddress ports cpus memory stateDir
-      readyTimeoutSeconds runtimeTimeoutSeconds;
+      readyTimeoutSeconds runtimeTimeoutSeconds lifecycleTimeoutSeconds;
     inherit (defaults) containerPorts dataDir brokerUid brokerGid;
   };
 
@@ -62,15 +62,23 @@ in
     enable = lib.mkEnableOption "a local Redpanda cluster running on Apple Container";
 
     package = lib.mkOption {
-      type = lib.types.package;
+      type = lib.types.nullOr lib.types.package;
       default = defaults.package;
       defaultText = lib.literalExpression "pkgs.container";
       description = ''
-        The Apple Container package providing the `container` binary.
+        The Apple Container package providing the `container` binary, or `null`
+        to use whichever `container` is on PATH when a script runs.
 
         Exposed as an option rather than pinned to `pkgs.container` because plain
         nixpkgs ships an older release than the one this is developed against; a
         consumer with an overlay that shadows `container` gets its version here.
+
+        It must be the same release as the running container-apiserver: a
+        mismatched client can hang rather than fail. The scripts compare the two
+        versions before doing anything and refuse to run on a mismatch (set
+        `REDPANDA_ALLOW_CONTAINER_VERSION_SKEW=1` to override). `null` is not
+        suitable here when `autoStart` is on, because the launchd agent's PATH
+        does not include the user's profile.
       '';
     };
 
@@ -238,6 +246,16 @@ in
 
         This is not a formality: the launchd agent can fire at login before
         container-apiserver is up, so the wait is what stops every login being a race.
+      '';
+    };
+
+    lifecycleTimeoutSeconds = lib.mkOption {
+      type = lib.types.int;
+      default = defaults.lifecycleTimeoutSeconds;
+      description = ''
+        Ceiling on `container start` and `container network create`, which should
+        take seconds. When Apple Container's network service wedges they block
+        forever with no output; past this the scripts stop and say how to recover.
       '';
     };
 

@@ -15,6 +15,17 @@
   # Apple Container. Exposed as an option rather than pinned to pkgs.container
   # because plain nixpkgs ships 1.1.0 while the dotfiles overlay shadows it with
   # a newer build. See MasterPlan Integration Point 1.
+  #
+  # The `container` CLI must be the same release as the running
+  # container-apiserver: a mismatched client can hang indefinitely instead of
+  # failing (a 1.1.0 client's `container start` against a 1.5.0 server never
+  # returned). Under home-manager, `pkgs` is the system's own package set, so
+  # pkgs.container is the build the server was installed from. A project flake
+  # that imports this file with its own nixpkgs does NOT get that guarantee, and
+  # should set `package = null`, which makes the scripts use the `container`
+  # found on PATH: the host's install, matching its server. The scripts
+  # check client and server versions before doing anything and refuse to run on
+  # a mismatch either way.
   package = pkgs.container;
 
   # Pulled from Docker Hub rather than docker.redpanda.com: the latter rate-limited
@@ -103,4 +114,12 @@
   # fire at login before container-apiserver is up, so this is a race that must be
   # waited out rather than failed on.
   runtimeTimeoutSeconds = 60;
+
+  # Ceiling on the container-lifecycle calls that should finish in seconds
+  # (`container start`, `container network create`). When Apple Container's
+  # network service wedges -- its per-network vmnet helpers have died, or an
+  # earlier network operation is stuck pending -- these block forever with no
+  # output. Bounding them turns that into a diagnosable failure. Not applied to
+  # `container run`, whose first use includes an image pull.
+  lifecycleTimeoutSeconds = 90;
 }
