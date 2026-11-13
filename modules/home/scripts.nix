@@ -160,7 +160,12 @@ let
           printf '    launchctl list | grep container-network-vmnet\n\n' >&2
           printf 'If they are dead, or container network create also hangs, restart the\n' >&2
           printf 'runtime. This stops every running container on the machine:\n\n' >&2
-          printf '    container system stop && container system start\n' >&2
+          printf '    container system stop && container system start\n\n' >&2
+          printf 'Then check that the apiserver PID changed:\n\n' >&2
+          printf '    launchctl list com.apple.container.apiserver\n\n' >&2
+          printf 'If it did not, the stop silently did nothing. Unload every\n' >&2
+          printf 'com.apple.container.* launchd job instead, as described under\n' >&2
+          printf 'Troubleshooting in https://github.com/shinzui/redpanda-container\n' >&2
         fi
         return "$rc"
       }

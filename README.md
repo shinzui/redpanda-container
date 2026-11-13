@@ -137,34 +137,90 @@ Both of these are consequences of behaviour verified by hand first. The transcri
 
 ## Troubleshooting
 
-If Console cannot reach the broker, or containers cannot reach each other at all, the
-runtime's networking has probably degraded — this happens, and it is not caused by anything
-this module does. Restart it:
+### The `container` CLI does not match the running service
+
+The scripts compare the CLI's release with the server's before doing anything. A mismatch
+means they were built against a different Apple Container release than the one installed.
+This happens when a project flake imports `scripts.nix` with its own nixpkgs: plain nixpkgs
+ships an older `container` than the dotfiles overlay. Set `package` to the build the server
+runs, or to `null` to use the host's `container` from PATH. A mismatched CLI is refused
+rather than tolerated because it can hang indefinitely instead of failing.
+
+### The Apple Container service is not responding
+
+Start it with `container system start`.
+
+### `container start` or `container network create` hangs
+
+`redpanda-up` reports this as a step that "did not finish in time". Apple Container's
+network service has wedged. Containers that were already running may still show `running`,
+but nothing new can join a network, and a running broker can stop answering: its ports
+accept connections and never reply. The same cause is likely when Console cannot reach the
+broker.
+
+Each network has a helper running as a launchd job. Check them:
 
 ```bash
-container system stop && container system start
-redpanda-up
+launchctl list | grep container-network-vmnet
 ```
 
-If `redpanda-up` reports the Apple Container service is not responding, start it with
-`container system start`.
+A `-` in the first column with status `-15` means that helper was terminated. The runtime
+does not relaunch it, and only a full runtime restart recovers. Every restart below stops
+every container on the machine, not only Redpanda.
 
-If it reports that the `container` CLI does not match the running service, the scripts were
-built against a different Apple Container release than the one installed. This
-happens when a project flake imports `scripts.nix` with its own nixpkgs: plain
-nixpkgs ships an older `container` than the dotfiles overlay. Set `package` to the build
-the server runs, or to `null` to use the host's `container` from PATH. A mismatched CLI is
-refused rather than tolerated because it can hang indefinitely instead of failing.
+1. Note the API server's PID, so you can tell whether the restart actually happened:
 
-If `redpanda-up` says a `container start` or `container network create` did not finish in
-time, Apple Container's network service has wedged. Running containers keep working, but
-nothing can join a network. `launchctl list | grep container-network-vmnet` shows each
-network's helper; a `-` PID with status `-15` means it was terminated. Only a runtime restart
-recovers from this, and it stops every container on the machine:
+   ```bash
+   launchctl list com.apple.container.apiserver | grep '"PID"'
+   ```
 
-```bash
-container system stop && container system start
-```
+2. Try the normal restart:
+
+   ```bash
+   container system stop && container system start
+   ```
+
+3. Check that the API server's PID changed and that every helper now has a PID:
+
+   ```bash
+   launchctl list com.apple.container.apiserver | grep '"PID"'
+   launchctl list | grep com.apple.container.
+   ```
+
+   If the PID is unchanged, `container system stop` did nothing, even though it exited 0.
+   It may also have shut Redpanda down inside a container that still shows `running`. Unload
+   every Apple Container launchd job instead, container VMs and network helpers first and the
+   API server last:
+
+   ```bash
+   jobs=$(launchctl list | awk '$3 ~ /^com\.apple\.container\./ {print $3}')
+   for job in $(printf '%s\n' $jobs | grep -E 'runtime-linux|network-vmnet') \
+              $(printf '%s\n' $jobs | grep -E 'core-images|machine-apiserver') \
+              com.apple.container.apiserver; do
+     launchctl bootout "gui/$(id -u)/$job"
+   done
+   launchctl list | grep com.apple.container.
+   ```
+
+   The last command should print nothing. A queued `container start` can launch a new job
+   while the others go down, so if anything is still listed, run the loop again. Then start
+   the runtime:
+
+   ```bash
+   container system start
+   ```
+
+4. Bring Redpanda back. Every other container stays stopped and needs its own start.
+
+   ```bash
+   redpanda-up
+   ```
+
+A real restart also reassigns network subnets. Before it, `container network list` can show
+two networks sharing a subnet. That happens when a new network takes the subnet of one whose
+helper died.
+
+### Starting over
 
 To reset completely, `redpanda-purge --force` followed by `redpanda-up` gives a clean
 cluster. This destroys all data.
